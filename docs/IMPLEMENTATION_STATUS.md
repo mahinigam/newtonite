@@ -763,8 +763,10 @@ the reason recorded in the Phase 5 section. The two frontend issues found in Pha
 missing testing-library cleanup and the unreachable `validation_failed` branch — were likewise
 fixed in the code.
 
-**Merge.** Merged to `main` as `MERGE_SHA` (a merge commit, not a fast-forward, so the
-phase-by-phase history stays readable). No history was rewritten and nothing was force-pushed.
+**Merge.** Merged to `main` as `6e7f2b4` (a merge commit, not a fast-forward, so the
+phase-by-phase history stays readable), on top of the Phase 1–2 work that landed in PR #1.
+Nothing was rewritten and nothing was force-pushed: the remote `main` had moved ahead while
+this branch was being built, so it was integrated rather than overwritten.
 
 **Known defects.** None known. The residual risks are the documented ones in
 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) — chiefly no login rate limiting, no
