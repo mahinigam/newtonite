@@ -281,7 +281,6 @@ async def seed(
     }
 
     now = datetime.now(UTC)
-    password_hash = hash_password(password)
 
     created["teams"] = await _insert_if_absent(
         session,
@@ -297,20 +296,7 @@ async def seed(
         ],
     )
 
-    created["users"] = await _insert_if_absent(
-        session,
-        User,
-        [
-            {
-                "id": stable_id("user", email),
-                "email": email,
-                "display_name": display_name,
-                "password_hash": password_hash,
-                "is_active": True,
-            }
-            for email, display_name, _ in USERS
-        ],
-    )
+    created["users"] = await _insert_users(session, password)
 
     created["memberships"] = await _insert_if_absent(
         session,
@@ -491,6 +477,33 @@ async def _insert_if_absent(
         result = await session.execute(statement, rows[start : start + chunk_size])
         created += len(result.scalars().all())
     return created
+
+
+async def _insert_users(session: AsyncSession, password: str) -> int:
+    """Create any missing demo accounts.
+
+    Each account gets its own Argon2id digest, so every demo user has a distinct
+    salt exactly as a real account would. The hash is computed only for accounts
+    that are actually missing: a repeat run does not spend a second hashing twelve
+    digests that nobody will read.
+    """
+    planned_ids = [stable_id("user", email) for email, _, _ in USERS]
+    existing = set(
+        (await session.execute(select(User.id).where(User.id.in_(planned_ids)))).scalars().all()
+    )
+
+    rows = [
+        {
+            "id": stable_id("user", email),
+            "email": email,
+            "display_name": display_name,
+            "password_hash": hash_password(password),
+            "is_active": True,
+        }
+        for email, display_name, _ in USERS
+        if stable_id("user", email) not in existing
+    ]
+    return await _insert_if_absent(session, User, rows)
 
 
 async def _insert_new_work_items(

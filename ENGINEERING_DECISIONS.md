@@ -184,6 +184,146 @@ cannot be handed a connection bound to a different event loop.
 
 ---
 
+## 6. Database-backed opaque sessions rather than JWTs
+
+**Context.** The API needs to identify a caller on every request, must be able to end a
+session immediately, and must not put a credential in the hands of an attacker who reads
+the database.
+
+**Options considered.**
+
+1. Signed stateless JWT in a cookie or `Authorization` header.
+2. Opaque random token with the server storing a hash of it.
+3. Server-side session with a session id in a cookie.
+
+**Choice.** Option 2: a 256-bit token from `secrets.token_urlsafe(32)`, stored only as its
+SHA-256 digest, in an `auth_sessions` row with `expires_at`, `last_used_at` and
+`revoked_at`.
+
+**Why.** The brief asks for expiration *and* revocation. A JWT is valid until it expires —
+revoking one requires either a denylist (which reintroduces the database lookup the JWT was
+meant to avoid) or a key rotation that logs everybody out. Since every protected request
+already touches the database, a stateless token buys nothing and costs the ability to sign
+someone out immediately. Storing only the digest means a database disclosure exposes
+expired hashes rather than live credentials. A hand-rolled cookie session adds CSRF
+concerns and a second credential concept for no benefit.
+
+**Trade-offs.**
+
+- Accepted: every authenticated request costs one indexed lookup on `token_hash`. Measured
+  as a single index probe, which is the same order as the work the request does anyway.
+- Accepted: no cross-service portability. There is one service.
+- Rejected: the ability to verify a token without the database.
+
+**Sub-decision: the digest is fast (SHA-256), the password hash is slow (Argon2id).** They
+have opposite threat models. A 256-bit random token cannot be brute-forced, so a memory-hard
+KDF would only add latency to every request. A human password can be guessed offline, so it
+gets Argon2id. Both are in `app/security/`.
+
+**Sub-decision: two clocks, one authority.** Absolute and idle expiry are both evaluated with
+PostgreSQL's `now()`, never the application's. With more than one process, an application-side
+comparison would grant a session a different lifetime depending on which process answered.
+`login` also derives `expires_at` from the database clock, so issuance and validation agree.
+
+**Sub-decision: `last_used_at` is refreshed at most once a minute.** The update is conditional
+in SQL (`... WHERE last_used_at < now() - interval '60 seconds'`), so reads do not become
+writes and two concurrent requests cannot both decide to update the row. The cost is that the
+idle window can be enforced up to a minute late; that is recorded in
+`docs/KNOWN_LIMITATIONS.md` rather than left implicit.
+
+**Consequences and verification.** `tests/test_auth.py` covers: unknown email and wrong
+password returning byte-identical responses; only a digest stored (and the raw token appearing
+in no column); missing, malformed and foreign-scheme headers; unknown and revoked tokens;
+absolute expiry; idle expiry; activity refreshing the idle window; two logins producing
+independent sessions; and an expired token not being resurrected by signing in again.
+
+---
+
+## 7. One error envelope, and 404 rather than 403 across a team boundary
+
+**Context.** Clients need to distinguish "sign in again", "you may not do that", "that is
+gone", "somebody changed this" and "your input is wrong" — without learning anything about
+resources they cannot see.
+
+**Options considered.**
+
+1. FastAPI's defaults (`{"detail": ...}`, plus a plain-text 500).
+2. A single envelope for every failure, produced by exception handlers.
+3. Per-route error shapes.
+
+**Choice.** Option 2, with a fixed mapping:
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| 401 | `not_authenticated`, `invalid_session`, `session_expired`, `invalid_credentials` | No usable session |
+| 403 | `forbidden` | Inside the team, role does not permit it |
+| 404 | `not_found` | Does not exist **or** is in a team you are not in |
+| 409 | `invalid_transition`, `item_already_claimed`, `idempotency_key_reuse`, `last_admin`, … | Conflicts with current state |
+| 412 | `stale_version` | Your `If-Match` version is out of date |
+| 422 | `validation_failed` | Request body rejected |
+
+**Why.** `code` is what the frontend branches on; `message` is written to be shown to a user
+without leaking anything. The 403/404 split carries the important policy: a caller **inside**
+a team whose role is insufficient gets 403, because they already know the team exists, and the
+message helps them understand. A caller outside the team gets 404, indistinguishable from a
+nonexistent resource, so the API cannot be used to confirm that another team's work item
+exists. `tests/test_authorization.py` asserts the two responses are byte-identical for a
+foreign team and a random UUID.
+
+**Trade-offs.**
+
+- Accepted: a stricter envelope than FastAPI's default, so framework-level errors (unknown
+  route, wrong method) need an adapter handler to avoid a second shape.
+- Accepted: the 404 choice is mildly less helpful for a legitimate user who typed a stale
+  team URL — the frontend compensates by only ever offering teams from `/auth/me`.
+- 500 responses are always the same generic body; the detail goes to the log, never to the
+  client.
+
+**Consequences and verification.** `app/errors.py` defines the types and installs the
+handlers; `tests/test_authorization.py` and `tests/test_auth.py` assert the status **and** the
+`code` for every case, and that a refused write leaves the stored role unchanged.
+
+---
+
+## 8. Authorization as an explicit permission matrix
+
+**Context.** Four roles, several protected actions, and a rule that the server decides — never
+the UI, and never a value from the request.
+
+**Options considered.**
+
+1. Role comparisons inline in route handlers (`if role == "admin"`).
+2. A declarative matrix: role → set of permissions, plus a principal that carries the caller's
+   roles per team.
+3. A policy DSL or external authorization service.
+
+**Choice.** Option 2. `app/policy/roles.py` holds the only role logic; `Principal` carries the
+roles, loaded from the database on every request; routes declare the permission they need as a
+dependency.
+
+**Why.** The matrix is a single reviewable table, so an auditor can answer "can a member close
+the item?" by reading eight lines instead of searching for string comparisons. Making it a
+dependency means a route cannot accidentally *perform* an action before checking it, and a
+route that forgot its check is conspicuous. Option 3 is infrastructure with no payoff at four
+roles.
+
+**Trade-offs.**
+
+- Accepted: for `PUT /teams/{id}/members/{user_id}`, that an admin may only set a role for
+  somebody who already shares a team with them. It cannot enumerate strangers, and it means
+  adding a brand-new person to a team is not possible through the API (seeded users only) —
+  recorded in `docs/KNOWN_LIMITATIONS.md`.
+- Accepted: admins currently have no capability a lead lacks except membership management.
+  The distinction is real but narrow, and `admin` is the role reserved for it.
+
+**Consequences and verification.** `tests/test_authorization.py`: a viewer cannot escalate
+anyone's role, a member cannot promote themselves, a lead cannot manage members, an admin can,
+and an admin of one team is answered with 404 for another team's roster. The permission table is
+also what the frontend will read via `/auth/me` — advisory only, since every write is checked
+again.
+
+---
+
 ## Decisions taken, not yet implemented
 
 Listed so the direction is explicit without implying that the behaviour exists.
@@ -193,8 +333,6 @@ Listed so the direction is explicit without implying that the behaviour exists.
 | Claim concurrency | Single conditional `UPDATE ... WHERE assignee_id IS NULL` that both checks eligibility and assigns; zero rows affected means somebody else won | Phase 4 |
 | Stale writes | `If-Match` version precondition evaluated inside the update statement; failure returns `412` with the current representation | Phase 4 |
 | Idempotent creation | Key row and work item written in one transaction, unique on `(actor_id, operation, key)`; concurrent duplicates block on the index and replay the stored outcome | Phase 4 |
-| Error semantics | `401` unauthenticated · `403` role denied inside your team · `404` for other-team resources (no existence leak) · `409` state conflict · `412` failed precondition · `422` validation | Phases 3–5 |
-| Authentication | Opaque random bearer token; only its SHA-256 digest is stored; absolute and idle expiry; revocation on logout | Phase 3 |
 | Search and pagination | Keyset (cursor) pagination with a stable tie-breaker; PostgreSQL full-text search over a generated `tsvector` with a GIN index | Phase 4 |
 | Async notifications | PostgreSQL-backed transactional outbox with a `SKIP LOCKED` worker, bounded backoff, idempotent handling. Conditional on the core slice passing first | Phase 7 |
 | Deliberately not built | Email, attachments, SSO, WebSockets, mobile, comment editing, reopen-after-close, rate limiting | See `docs/KNOWN_LIMITATIONS.md` |

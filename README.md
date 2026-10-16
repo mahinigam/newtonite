@@ -13,7 +13,7 @@ of concurrent and retried requests.
 > phase-by-phase state, and [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for
 > what is deliberately missing.
 
-## What works today (Phase 2 — domain, integrity and demo data)
+## What works today (Phase 3 — authentication and team authorization)
 
 | Capability | Status |
 | --- | --- |
@@ -24,11 +24,15 @@ of concurrent and retried requests.
 | Database-enforced invariants (team/assignee consistency, append-only history, value sets) | Working, tested |
 | Deterministic, idempotent demo seed (~3 000 work items, 12 users, 4 teams) | Working |
 | Index inventory matched to query patterns, with measured plans | Working — see [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) |
+| Login, logout and session validation (Argon2id, hashed tokens, absolute + idle expiry, revocation) | Working |
+| Per-team authorization with an explicit role matrix, enforced on the server | Working |
+| Teams, membership and roster endpoints; admin-only role management | Working |
+| One error envelope: `401` / `403` / `404` / `409` / `412` / `422` with stable codes | Working |
 | Liveness (`/healthz`) and readiness (`/readyz`) endpoints | Working |
-| Backend test suite against real PostgreSQL | Working (33 tests) |
+| Backend test suite against real PostgreSQL | Working (68 tests) |
 | Docker Compose PostgreSQL for reviewers | Working |
 | CI: formatting, lint, types, migrate, seed, tests | Working |
-| Authentication, work-item API, workflow, frontend | Not yet — see [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) |
+| Work-item API, workflow transitions, frontend | Not yet — see [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) |
 
 ## Technology stack
 
@@ -137,9 +141,21 @@ These are **development placeholders, not secrets**, and they exist so a reviewe
 exercise every role without creating accounts. `sam.multi` deliberately holds a different
 role in each of two teams — the case a per-team role model has to get right.
 
-> The login endpoint arrives with the authentication phase, so these accounts are in the
-> database but not yet reachable over HTTP. See
-> [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md).
+Try it without a client:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"sam.multi@newtonite.dev","password":"Newtonite!2026"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+
+curl -s http://localhost:8000/api/v1/auth/me    -H "Authorization: Bearer $TOKEN"
+curl -s http://localhost:8000/api/v1/teams      -H "Authorization: Bearer $TOKEN"
+```
+
+`/auth/me` returns the caller's role in each team, which is how the frontend knows what to
+offer. It is advisory to the interface only — every write is authorized again on the server.
+The full endpoint list is in [`docs/API.md`](docs/API.md).
 
 ### 6. Run the API
 
@@ -179,15 +195,21 @@ manual preparation is needed beyond creating the empty `newtonite_test` database
 backend/
   alembic/            migration environment and revisions
   app/
-    api/              FastAPI routers (thin HTTP layer)
+    api/              FastAPI routers (thin HTTP layer) and dependencies
     models/           SQLAlchemy ORM models and domain enums
+    policy/           the role matrix and the authenticated principal
+    schemas/          request and response models, separate from the ORM
+    security/         password hashing and session tokens
+    services/         business rules, testable without a request
     config.py         environment-driven settings
     db.py             async engine and session management
+    errors.py         error types and the HTTP error envelope
     main.py           application factory
+  scripts/            the deterministic demo seed
   tests/              integration tests against PostgreSQL
 docker/
   initdb/             creates the test database on first Compose start
-docs/                 architecture, decisions, status and review material
+docs/                 architecture, API, decisions, status and review material
 frontend/             React application (added in a later phase)
 ```
 
@@ -195,6 +217,8 @@ frontend/             React application (added in a later phase)
 
 | Document | Contents |
 | --- | --- |
+| [`docs/API.md`](docs/API.md) | Endpoints, authentication, error codes and worked examples |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Layers, request flow and where each rule lives |
 | [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) | Entities, integrity rules, indexes and measured query plans |
 | [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | Phase-by-phase status with verification evidence |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Configuration, migrations, diagnosis, safe resets |
@@ -204,11 +228,18 @@ frontend/             React application (added in a later phase)
 ## Security notes
 
 - No secrets are committed. `.env.example` contains placeholders only.
-- Passwords are hashed with Argon2id and `auth_sessions` stores only a SHA-256 digest of
-  a session token, never the token itself. The schema enforces this today; the code that
-  uses it lands with the authentication phase — see
-  [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md).
-- Authorization is enforced on the server; the UI never decides permissions.
+- Passwords are hashed with Argon2id. Session tokens are 256 bits of randomness and are
+  stored **only** as a SHA-256 digest, so a database disclosure does not yield usable
+  sessions. A fast digest is used here deliberately, because a random token cannot be brute
+  forced; passwords get a memory-hard KDF because they can be.
+- Sessions have both an absolute lifetime (12 h) and an idle lifetime (2 h), and logout
+  revokes immediately. Expiry is evaluated with the database clock, not the application's.
+- Authorization is enforced on the server, per team, from stored memberships. A `team_id`,
+  `role` or `user_id` in a request body is never trusted — unknown fields are rejected.
+- A resource in a team the caller does not belong to returns `404`, not `403`, so responses
+  cannot be used to confirm that another team's data exists.
+- Not yet built and documented as such: login rate limiting, password reset, and MFA. See
+  [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for the residual risk.
 
 Deployment caveats, including the recommended `Content-Security-Policy`, are documented
 in [`docs/OPERATIONS.md`](docs/OPERATIONS.md).

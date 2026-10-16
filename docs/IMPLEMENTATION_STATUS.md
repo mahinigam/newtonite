@@ -13,7 +13,7 @@ result observed in this repository — not that the code looks correct.
 | 0 | Reconnaissance and design | Complete | Repository inspected, remote confirmed empty, brief and execution plan read |
 | 1 | Runnable foundation | Complete | See below |
 | 2 | Domain, seed data and constraint tests | Complete | See below |
-| 3 | Authentication and team authorization | Not started | — |
+| 3 | Authentication and team authorization | Complete | See below |
 | 4 | Core API and critical correctness behaviours | Not started | — |
 | 5 | Workflow, collaboration and activity API | Not started | — |
 | 6 | Frontend vertical slice | Not started | — |
@@ -197,6 +197,95 @@ same columns — the kind of bug that would otherwise surface as silent data los
 
 **Remaining gaps.** No API endpoints yet, so the seeded data is only reachable through
 `psql`. No authentication. No frontend.
+
+**Known defects.** None known.
+
+## Phase 3 — Authentication and team authorization
+
+**Requirements.** Real authentication (not a placeholder), authorization decided on the
+server for every protected action, and no client-supplied identity or role ever being trusted.
+
+**Acceptance criteria.** A login issues a credential that expires and can be revoked;
+credentials are stored so that a database disclosure does not yield usable sessions;
+every team-scoped endpoint authorizes against stored membership; a caller outside a team
+cannot confirm that the team's data exists; role restrictions are proven by tests that
+attempt the forbidden action.
+
+**What was built.**
+
+- `app/security/tokens.py` — 256-bit opaque tokens, stored only as a SHA-256 digest.
+- `app/services/auth.py` — login, session resolution, revocation, session housekeeping.
+  Absolute and idle expiry, both evaluated with the database clock.
+- `app/policy/roles.py` — the permission matrix, defined once.
+- `app/policy/principal.py` — the authenticated caller, carrying their role per team.
+- `app/api/deps.py` — `get_principal` and `require_team_permission(...)` dependencies.
+- `app/errors.py` — one error envelope with stable codes, installed on the app.
+- `app/api/v1/` — `auth` (login, logout, me), `teams` (list, roster, set role, remove
+  member) and `users` (scoped directory) routers.
+- `scripts/maintenance.py` — operator commands to revoke one account's sessions and purge
+  long-expired ones.
+- `tests/test_auth.py` (15), `tests/test_authorization.py` (20),
+  `tests/test_session_housekeeping.py` (5).
+
+**Design details worth recording.**
+
+- *The token is never stored.* The raw token appears only in the login response. A test reads
+  every column of `auth_sessions` and asserts the token appears in none of them.
+- *Two lifetime rules.* Absolute (12 h from login) and idle (2 h since last use). Every
+  comparison uses PostgreSQL's `now()`, so two API processes cannot disagree; `login` also
+  derives `expires_at` from the database clock.
+- *Reads do not become writes.* `last_used_at` is refreshed at most once a minute, with the
+  condition in the `WHERE` clause. Documented, with its one-minute slack, rather than hidden.
+- *Failed logins do not leak which addresses have accounts.* Unknown email, wrong password and
+  deactivated account return byte-identical `401 invalid_credentials` responses, and the
+  unknown-email path spends a real Argon2id verification so the timing matches. A test asserts
+  the bodies are equal.
+- *404 rather than 403 across a team boundary.* A caller outside a team gets the same answer
+  for a real team id and for a random UUID; a test asserts the two responses are identical.
+- *Authorization is a dependency.* A route that needs a permission declares it, so it is not
+  possible to perform the work before checking.
+- *Roles are advisory to the UI, authoritative on the server.* `/auth/me` returns the caller's
+  roles so the interface can decide what to show, and every write is checked again from stored
+  memberships.
+- *Two invariants that protect a team.* A team keeps at least one admin, and a member who is
+  still the assignee of work items cannot be removed — the composite foreign key would refuse
+  it anyway, but the API turns that into an instruction ("reassign their work first") instead
+  of a raw integrity error. A test reassigns the item and asserts the removal then succeeds.
+- *Removing a member does not touch history.* Removing a membership leaves `activity_events`
+  exactly as it was; a test counts them before and after.
+
+**Verification.**
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Backend tests | `uv run pytest -q` | Passed — **68 passed** (was 33) |
+| Formatting / lint / types | `ruff format --check`, `ruff check`, `mypy .` | Passed — 50 files formatted, 49 files type-checked |
+| End-to-end against the seeded dev database | `uvicorn`, then `curl` login → `/auth/me`, `/teams`, rosters, refusals | Passed — see below |
+| CI (GitHub Actions) | run on the Phase 3 commit | Recorded in the commit's Actions run |
+
+**End-to-end evidence against the real seeded dataset** (3 000 items, 12 demo accounts, real
+Argon2id hashes, the documented password):
+
+- `sam.multi@newtonite.dev` signed in and `/auth/me` returned **two memberships with different
+  roles**: `platform: member` and `finance: viewer`.
+- A wrong password and an unknown email returned the **same** body:
+  `{"error":{"code":"invalid_credentials","message":"Email or password is incorrect."}}`.
+- `vic.viewer` (viewer) read the platform roster: `200`.
+- `sam.multi` (member) and `lena.lead` (lead) each attempted to change a role: `403 forbidden`.
+- `sam.multi` (viewer **in** finance) attempted the same in finance: `403`.
+- `ada.admin` (admin of platform, **not** a member of finance) attempted it in finance: `404`.
+  Same request, different boundary — this is the 403/404 distinction working.
+- An invalid role value: `422`, with the field named in `details`.
+- After every refusal, the roster was re-read and was **unchanged**.
+- The directory returned 8 people for `sam.multi` — the union of platform and finance, and
+  nobody from the teams they are not in.
+
+**Commit.** See the commit history on `feature/newtonite-operations-platform`. No history was
+rewritten.
+
+**Remaining gaps.** No work-item endpoints yet, so the seeded items are still only reachable
+through `psql`. No frontend. No login rate limiting (documented in
+[`SECURITY.md`](SECURITY.md) with the residual risk).
 
 **Known defects.** None known.
 

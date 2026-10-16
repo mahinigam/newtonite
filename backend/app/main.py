@@ -18,6 +18,7 @@ from app.api import health
 from app.api.v1.router import api_router
 from app.config import Settings, get_settings
 from app.db import create_database
+from app.errors import register_exception_handlers
 
 API_V1_PREFIX = "/api/v1"
 
@@ -65,6 +66,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(api_router, prefix=API_V1_PREFIX)
+
+    # Registered last so the envelope applies to every failure, including
+    # framework-generated ones.
+    register_exception_handlers(app)
 
     return app
 

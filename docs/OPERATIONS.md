@@ -64,6 +64,9 @@ express it.
 | Tests wipe unexpected data | `TEST_DATABASE_URL` points at a database you care about. Stop, fix the URL, and restore from a backup |
 | `alembic check` reports differences | A model changed without a migration (or vice versa). Create a revision and review it |
 | `activity_events is append-only` | Something tried to `UPDATE`/`DELETE` history. That is the intended behaviour |
+| Login works, then every request returns `401 session_expired` | The session hit its absolute or idle lifetime. Lifetimes are `SESSION_ABSOLUTE_TTL_HOURS` / `SESSION_IDLE_TTL_HOURS`; check the host clock, because a large skew from the database makes freshly issued sessions look stale |
+| Login returns `401 invalid_credentials` for an account you can see in `psql` | The password is wrong, or the account is deactivated (`is_active = false`). The response is deliberately identical in both cases |
+| A user's role change does not take effect | It does, from their next request — roles are read from `memberships` every request and are not stored in the session |
 | Port 5432 already in use by Compose | Compose is mapped to 5433 precisely to avoid this; check `.env` |
 
 Logs are written to standard error at the level set by `LOG_LEVEL`. Set `LOG_LEVEL=DEBUG`
@@ -102,11 +105,33 @@ If a credential is ever exposed:
 
 1. Rotate it in the source system. Deleting a file from the latest commit does **not**
    remove it from Git history — rotate first, then clean history if required.
-2. Revoke affected sessions:
+2. Revoke the affected sessions. All sessions, with SQL:
    ```sql
    UPDATE auth_sessions SET revoked_at = now() WHERE revoked_at IS NULL;
    ```
-   Revocation takes effect on the next request; sessions are not cached in process.
+   Or one account, with the maintenance command:
+
+   ```bash
+   cd backend
+   uv run python -m scripts.maintenance revoke-sessions --email ada.admin@newtonite.dev
+   ```
+
+   Revocation takes effect on the next request; sessions are validated against the
+   database every time and are never cached in the process, so no restart is needed.
+
+### Session housekeeping
+
+Expired sessions are refused on read, so they cost correctness nothing — only space:
+
+```bash
+cd backend
+uv run python -m scripts.maintenance purge-expired-sessions
+```
+
+This deletes sessions that expired more than a week ago and reports how many remain,
+leaving recent rows in place so a support question about a session can still be answered
+from the table. It is the only code path that deletes from `auth_sessions`; nothing
+expires a session by deleting it.
 
 ## Deployment caveats
 
