@@ -174,7 +174,9 @@ application; indexes match the query patterns.
 | Backend tests | `uv run pytest -q` | Passed — **33 passed** (was 12) |
 | Formatting / lint / types | `ruff format --check`, `ruff check`, `mypy .` | Passed |
 | Index plans at 3 000 items | `EXPLAIN (ANALYZE, BUFFERS)` on the five hot queries | See `docs/DATA_MODEL.md` |
-| CI | run on the Phase 2 commit | Recorded in the commit's Actions run |
+| CI (GitHub Actions) | run `38966610036` | Passed — every step green, including *Migrate the development database* and *Seed a small dataset* |
+
+**Commit.** `384fe6a` on `feature/newtonite-operations-platform`. No history was rewritten.
 
 **Measured query behaviour** (3 000 items, after `ANALYZE`): team list 0.18 ms via
 `ix_work_items_team_status_created`; "assigned to me" 0.18 ms via
