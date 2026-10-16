@@ -86,7 +86,20 @@ avoid documenting a command that cannot run. Seeding lands in Phase 2.
 | Lint | `uv run ruff check .` | Passed — all checks passed |
 | Strict types | `uv run mypy .` | Passed — no issues in 25 source files |
 | Health endpoints | `tests/test_health.py` | Passed |
-| CI | GitHub Actions `CI` workflow | See the note below |
+| CI (GitHub Actions) | run `38965759133`, job `Backend (lint, types, tests)` | Passed in 32s |
+
+**Commits.** `a9d3e89` (foundation, pushed to `main` and this branch), `530b573`,
+`937c7d1`, `aaedb7f` (CI corrections). Two CI fixes were needed and are recorded rather
+than hidden: `setup-uv` publishes exact tags only, so `@v10` did not resolve and had to be
+pinned to `v10.3.0`; and `ubuntu-latest` is scheduled to move to Ubuntu 26 on
+19 October 2026, inside the delivery window, so the runner image is pinned.
+
+**Initial history.** `main` had no commits, so a documented decision was made to create
+the foundation as the first commit on `main` (rather than leaving the default branch
+empty while work happened elsewhere), then continue on
+`feature/newtonite-operations-platform`. Both branches point at the foundation today, and
+the feature branch is merged back at the end. No history was rewritten and no force push
+was used.
 
 **Invariants proven at the database layer** (`tests/test_schema_constraints.py`), by
 issuing raw SQL rather than going through application code:
