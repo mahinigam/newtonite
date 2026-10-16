@@ -1,0 +1,75 @@
+name: CI
+
+# Runs the checks that exist today. Frontend jobs are added with the frontend
+# phase, and are not listed here before they can actually run.
+
+on:
+  push:
+    branches: ["main", "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (lint, types, tests)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: newtonite
+          POSTGRES_PASSWORD: newtonite_dev_pw
+          POSTGRES_DB: newtonite
+        ports:
+          - 5432:5432
+        # Without a healthy service the test job would fail with a confusing
+        # connection error instead of a clear one.
+        options: >-
+          --health-cmd "pg_isready -U newtonite -d newtonite"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+asyncpg://newtonite:newtonite_dev_pw@127.0.0.1:5432/newtonite
+      TEST_DATABASE_URL: postgresql+asyncpg://newtonite:newtonite_dev_pw@127.0.0.1:5432/newtonite_test
+      PGPASSWORD: newtonite_dev_pw
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create the disposable test database
+        run: psql -h 127.0.0.1 -U newtonite -d newtonite -c "CREATE DATABASE newtonite_test OWNER newtonite;"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies (locked)
+        run: uv sync --frozen --group dev
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy .
+
+      - name: Tests
+        run: uv run pytest -q
