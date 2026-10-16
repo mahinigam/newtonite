@@ -3,8 +3,8 @@
 A truthful, phase-by-phase record. "Verified" means the listed command was run and its
 result observed in this repository — not that the code looks correct.
 
-**Branch:** `feature/newtonite-operations-platform`
-**Last updated:** 2026-10-17 (end of Phase 6)
+**Branch:** `feature/newtonite-operations-platform`, merged to `main`
+**Last updated:** 2026-10-17 (end of Phase 8)
 
 ## Phase summary
 
@@ -17,8 +17,8 @@ result observed in this repository — not that the code looks correct.
 | 4 | Work-item API and the five critical correctness behaviours | Complete | See below |
 | 5 | Comments API and activity history API | Complete | See below |
 | 6 | Frontend vertical slice | Complete | See below |
-| 7 | Transactional outbox and worker (conditional) | Not started | Gate not yet assessed |
-| 8 | Final quality, documentation and reviewer readiness | Not started | — |
+| 7 | Transactional outbox and worker (conditional) | **Deferred** — gate assessed, recommendation recorded | See "Phase 7 assessment" below |
+| 8 | Final quality, documentation and reviewer readiness | Complete | See below |
 
 ## Phase 0 — Reconnaissance and design
 
@@ -661,6 +661,114 @@ support. The e2e contract check added one probe item to the development database
 ordinary row.
 
 **Known defects.** None known.
+
+## Phase 7 assessment — transactional outbox and worker
+
+**This phase was deliberately not built.** The plan made it conditional: implement it only
+after the critical correctness tests and the complete frontend vertical slice pass. Both
+conditions are now met, so the gate is open — and the recommendation is still to defer. The
+reasoning is recorded here because a deferral is a decision, and an unrecorded one looks like
+an omission.
+
+**Recommendation: defer.** Not because there was no time, but because there is nothing for it
+to do.
+
+**The brief does not ask for it.** The behaviours the assessment names as valuable beyond CRUD
+are "concurrent usage, authorization, workflow enforcement, reliable history, stale updates,
+duplicate-request handling, server-side filtering/pagination, tests". All of them are
+implemented and tested (see the Phase 4 and 5 sections). An outbox is not among them. The brief
+says idempotency records and an outbox "may be included **when their behaviours are actually
+implemented**" — and the operative word is *actually*. A message with no recipient has no
+behaviour to demonstrate.
+
+**There is no consumer, and that is by design.** An outbox exists to make an asynchronous side
+effect atomic with the state change that caused it — a notification, a webhook, a projection.
+This project deliberately excludes email, webhooks and WebSockets (scope discipline, recorded in
+`ENGINEERING_DECISIONS.md`). With no side effect to perform, the worker would deliver messages to
+itself and log the result. That is infrastructure with no concrete requirement behind it, which
+`AGENTS.md` explicitly warns against.
+
+**It would be the only unverified component.** `AGENTS.md` requires that if a worker exists,
+"duplicate processing is harmless and retry exhaustion is observable" — both tested. Done
+properly that means a `SKIP LOCKED` claim loop, bounded backoff, a retry cap, poison-message
+handling, graceful shutdown, and tests for each. Done partially, it would be the one part of the
+system that is neither complete nor verified, added days before submission. The system is
+currently green end to end (186 backend tests, 55 frontend tests, clean lint and types, green
+CI, measured query plans); the downside of deferring is a documented gap, and the downside of a
+rushed implementation is a broken component in a submission whose whole value is correctness.
+
+**What it would take, so the deferral is a design decision rather than a shrug.**
+
+- A table `outbox_events(id BIGSERIAL, event_type, aggregate_type, aggregate_id, payload JSONB,
+  created_at, available_at, attempts INT NOT NULL DEFAULT 0, claimed_at, claimed_by,
+  delivered_at, last_error)`.
+- Rows written **in the same transaction as the mutation that produces them** — the same pattern
+  the activity events already use, so the message and the state change commit or roll back
+  together. That atomicity is the one property worth demonstrating, and it is a small change to
+  the existing services.
+- A worker claiming bounded batches with `SELECT … FOR UPDATE SKIP LOCKED` ordered by
+  `available_at`, with bounded exponential backoff on `attempts` and a `delivered_at` marker.
+  Retry exhaustion becomes *observable* — a queryable state with `attempts >= max_attempts` —
+  rather than a silent drop.
+- Idempotent consumption keyed on `(event_type, aggregate_id)`, so a duplicate delivery is a
+  no-op.
+- Tests: two workers racing for one batch deliver each message once; a handler that always raises
+  exhausts its attempts and is visible in that state; a failed enqueue rolls the mutation back.
+
+**What is missing for it to be worth building.** A real notification channel. That is the honest
+first item on the "next week" list in the `README`, and it is where the work should start —
+because the outbox is only interesting once something is listening.
+
+## Phase 8 — Final quality, documentation and reviewer readiness
+
+**Requirements.** Re-run every gate on the finished system, check that the documentation
+describes what actually runs rather than what was intended, make the submission reviewable by
+someone with limited time, and merge to `main`.
+
+**Documentation audit.** Documentation that drifts is worse than none, so every load-bearing
+claim was checked against the running system rather than re-read:
+
+| Claim | How it was checked | Result |
+| --- | --- | --- |
+| The API surface in `docs/API.md` | Enumerated the app's OpenAPI schema and compared | **20/20 operations documented, none undocumented, none missing** |
+| The demo accounts in `README.md` | Compared against the users `scripts/seed.py` creates | **12/12 match exactly** |
+| The `Makefile` targets named in the README | `make help` | Every documented target exists |
+| `.env.example` files | Read all of them | Placeholders only; no real credentials, keys or tokens |
+| Test counts stated in the README | `uv run pytest --collect-only -q` and `npm run test` | 186 backend, 55 frontend — both match |
+| Error codes and status codes in `docs/API.md` | Cross-checked against the exception handlers and the contract check | Consistent |
+| Frontend behaviour described in `docs/FRONTEND.md` | Re-derived from the source files it names | Consistent |
+| The "not built" list in `docs/KNOWN_LIMITATIONS.md` | Compared against the route table and the frontend's views | Accurate — nothing listed is silently present |
+
+**Additions for the reviewer.** A "Where to look first" table in the `README` maps each of the
+five correctness behaviours to the test that proves it and the decision record that explains it,
+so the claim can be checked rather than trusted. A "Next week I would…" section lists the work
+in priority order, starting with the notification channel the deferred outbox is waiting on.
+
+**Verification.**
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Every gate at once | `make check` | Passed — backend lint + types + **186 tests**, frontend lint + types + **55 tests** |
+| Production build | `npm run build` | Passed — 296.58 kB JS (89.24 kB gzip), 8.89 kB CSS (2.34 kB gzip) |
+| Migration drift | `uv run alembic check` | "No new upgrade operations detected" |
+| Real-HTTP contract check | script against the seeded database and a real `uvicorn` process | **41/41 checks passed** |
+| CORS preflight | `OPTIONS /api/v1/items` with the Vite origin | Passed |
+| CI (GitHub Actions) | run [`38980249711`](https://github.com/mahinigam/newtonite/actions/runs/38980249711) | Passed — both jobs green |
+
+**What was not weakened to get here.** No test was skipped, deleted or relaxed, and no
+assertion was rewritten to match observed behaviour. The two bugs found during verification
+(the pagination fixture that assumed insertion order equals id order, and the activity endpoint
+accepting an item-list cursor) were fixed in the implementation or in a *defective* test, with
+the reason recorded in the Phase 5 section. The two frontend issues found in Phase 6 — the
+missing testing-library cleanup and the unreachable `validation_failed` branch — were likewise
+fixed in the code.
+
+**Merge.** Merged to `main` as `MERGE_SHA` (a merge commit, not a fast-forward, so the
+phase-by-phase history stays readable). No history was rewritten and nothing was force-pushed.
+
+**Known defects.** None known. The residual risks are the documented ones in
+[`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) — chiefly no login rate limiting, no
+browser-driven end-to-end test, and the deferred outbox.
 
 ## How to read this document
 

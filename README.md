@@ -49,6 +49,25 @@ guess at it.
 | Docker Compose PostgreSQL for reviewers | Working |
 | CI: backend and frontend jobs, formatting, lint, types, migrate, seed, tests, build | Working |
 
+## Where to look first
+
+The assessment asks for meaningful behaviour beyond CRUD. Five such behaviours are
+implemented and tested. Each row below names the behaviour, the test that proves it, and
+the document that explains the reasoning — so a reviewer can check the claim rather than
+take it on trust.
+
+| Behaviour | The test that proves it | The reasoning |
+| --- | --- | --- |
+| **Two concurrent claims produce at most one owner** | `tests/test_claim.py`, `tests/test_items_concurrency.py` — two `POST /claim` calls are issued concurrently on separate connections; exactly one returns `200` | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) 5, [`docs/API.md`](docs/API.md) |
+| **A write based on a stale version is refused, not applied** | `tests/test_items_update.py`, `tests/test_transitions.py` — a `PATCH` with an old `ETag` returns `412` and the stored row is unchanged | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) 6 |
+| **A retried request cannot create a duplicate** | `tests/test_items_create.py`, `tests/test_comments.py` — the same `Idempotency-Key` twice creates one row and replays the first result; a different payload under the same key returns `409` | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) 7 |
+| **Workflow and role rules are enforced on the server** | `tests/test_transitions.py`, `tests/test_authorization.py` — invalid transitions are refused, a viewer cannot write, and another team's item is a `404` | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) 8, 11, 12 |
+| **History cannot diverge from the state it describes** | `tests/test_activity_atomicity.py` — the activity insert is broken on purpose and the item mutation rolls back with it | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) 9 |
+
+A one-command check of the first four, over real HTTP against the seeded database, is in
+[`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) (Phase 4 and Phase 5
+sections) — the scripts are not committed, but the commands and the observed results are.
+
 ## Technology stack
 
 | Layer | Choice |
@@ -350,3 +369,34 @@ docs/                 architecture, frontend, API, decisions, status and review 
 
 Deployment caveats, including the recommended `Content-Security-Policy`, are documented
 in [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+
+## Next week I would…
+
+In rough priority order, and stated as work rather than wishes:
+
+1. **Give the outbox something to deliver, then build it.** A notification channel — "you were
+   assigned", "your item was approved", "your item was sent back" — as email or a webhook.
+   The transactional outbox is only worth building once something is listening, which is why
+   it was deferred with a design sketch rather than half-built; see the Phase 7 assessment in
+   [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md).
+2. **Browser-driven end-to-end tests in CI.** Playwright against a seeded database, signing in
+   as each role and exercising the claim, approval, comment, conflict and refusal paths. The
+   frontend tests stub the network, and the wire format was verified by a script run by hand —
+   that should be a permanent gate, not a one-off.
+3. **Login rate limiting and lockout.** Per-account and per-IP attempt counters with backoff and
+   alerting on spikes. This is the largest remaining security gap and the only one that is a
+   realistic attack rather than a residual risk.
+4. **A member-management screen.** The API is complete and tested — adding, changing and
+   removing members, admin only, with the last-admin and assigned-items rules enforced — but the
+   interface has no view for it.
+5. **Reopen-after-close**, with an explicit authorization rule, a reason, and a history event.
+   `CLOSED` is terminal today, which is a deliberate simplification rather than a permanent
+   answer.
+6. **Deployment**: a container image for the API, a static host for the built `dist/` with the
+   recommended CSP, and TLS termination in front of both.
+7. **Measure at a larger scale.** The plans are measured at 3 000 items; a bigger seed with
+   `EXPLAIN (ANALYZE, BUFFERS)` would show where the current indexes stop being sufficient, and
+   would turn "bounded and indexed" into a number.
+8. **Kind-tagged or signed cursors**, if a paginated position ever becomes something a user can
+   share or edit. Today a cursor is opaque but unsigned, which is correct for a
+   server-generated position and would not be for a URL.
