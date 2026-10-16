@@ -261,7 +261,7 @@ attempt the forbidden action.
 | Backend tests | `uv run pytest -q` | Passed — **68 passed** (was 33) |
 | Formatting / lint / types | `ruff format --check`, `ruff check`, `mypy .` | Passed — 50 files formatted, 49 files type-checked |
 | End-to-end against the seeded dev database | `uvicorn`, then `curl` login → `/auth/me`, `/teams`, rosters, refusals | Passed — see below |
-| CI (GitHub Actions) | run on the Phase 3 commit | Recorded in the commit's Actions run |
+| CI (GitHub Actions) | run `38968414101` | Passed — every step green, including the 73-test suite |
 
 **End-to-end evidence against the real seeded dataset** (3 000 items, 12 demo accounts, real
 Argon2id hashes, the documented password):
@@ -280,8 +280,7 @@ Argon2id hashes, the documented password):
 - The directory returned 8 people for `sam.multi` — the union of platform and finance, and
   nobody from the teams they are not in.
 
-**Commit.** See the commit history on `feature/newtonite-operations-platform`. No history was
-rewritten.
+**Commit.** `16d1b59` on `feature/newtonite-operations-platform`. No history was rewritten.
 
 **Remaining gaps.** No work-item endpoints yet, so the seeded items are still only reachable
 through `psql`. No frontend. No login rate limiting (documented in
