@@ -76,5 +76,14 @@ jobs:
       - name: Type check
         run: uv run mypy .
 
+      # Exercises the documented setup path end to end on a clean database:
+      # migrate, then seed. A broken migration or seed fails CI here rather than
+      # in a reviewer's terminal.
+      - name: Migrate the development database
+        run: uv run alembic upgrade head
+
+      - name: Seed a small dataset
+        run: uv run python -m scripts.seed --items 200
+
       - name: Tests
         run: uv run pytest -q

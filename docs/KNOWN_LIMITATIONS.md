@@ -3,7 +3,7 @@
 This document states what the project does **not** do, why, and what it would take to
 address each item. It is updated every phase and reflects the code as pushed.
 
-Last updated: 2026-10-17 (end of Phase 1).
+Last updated: 2026-10-17 (end of Phase 2).
 
 ## Not built yet, by plan
 
@@ -12,14 +12,13 @@ nothing in the repository claims they work.
 
 | Area | Status | Planned phase |
 | --- | --- | --- |
-| Authentication (login, sessions, logout) | Not implemented. The `auth_sessions` table exists. | 3 |
+| Authentication (login, sessions, logout) | Not implemented. The `auth_sessions` table and password hashing exist, but there is no login endpoint | 3 |
 | Team and role authorization on endpoints | Not implemented | 3 |
 | Work-item create/read/update endpoints | Not implemented | 4 |
-| Atomic claim, stale-write rejection, idempotent creation | Not implemented | 4 |
-| Workflow transitions and approvals | Not implemented | 5 |
+| Atomic claim, stale-write rejection, idempotent creation | Not implemented. The constraints that will back them are in place and tested | 4 |
+| Workflow transitions and approvals | Not implemented. The seed only generates states the workflow allows | 5 |
 | Comments and activity API | Not implemented | 5 |
 | Frontend application | Not implemented | 6 |
-| Seed data | Not implemented; `alembic upgrade head` is the only setup step | 2 |
 | Transactional outbox and worker | Not implemented; conditional on the core slice passing its gates | 7 |
 
 ## Deliberately excluded from scope
@@ -49,8 +48,10 @@ deferred.
 | Enum-like values live in both a Python enum and a SQL `CHECK` | Adding a value needs a coordinated change, and a mismatch is only caught by tests | A test asserts each value set against the database; a generated constraint would remove the duplication |
 | The test suite truncates a real database | Tests cannot run in parallel against the same database, and a misconfigured `TEST_DATABASE_URL` would destroy data | Documented prominently in `README.md` and `docs/OPERATIONS.md`; a per-worker schema or database would allow parallelism |
 | Single API process, no shared connection pool | Horizontal scaling needs an external pooler (for example PgBouncer) | Stated as an evolution path, not a current capability |
-| No measurements at the target scale | The brief's figures (tens of thousands of items, thousands of concurrent users) are design expectations. No load test has been run, and no performance claim is made | Seed a few thousand items, inspect query plans with `EXPLAIN ANALYZE`, then load test |
+| No measurements at the target scale | The brief's figures (tens of thousands of items, thousands of concurrent users) are design expectations. Query plans were inspected at 3 000 items, but no load test has been run and no throughput claim is made | Seed a few thousand items, inspect plans (done — see `docs/DATA_MODEL.md`), then load test against the brief's target |
+| Full-text search does not use its GIN index at the seeded size | At 3 000 rows the planner correctly prefers a sequential scan even for selective terms, so the GIN index is not exercised in the default dataset. The index is correct and ~4× faster when forced | Measured and documented rather than hidden; re-measure at tens of thousands of rows |
 | No observability beyond structured logs | Diagnosing a production incident would rely on logs alone | Add request IDs, metrics and tracing when the deployment target is known |
+| Seeding is additive, not converging | Editing the generator does not change rows that already exist, so a stale local dataset needs a schema rebuild | A converging seed (`ON CONFLICT DO UPDATE`) once the item generator is stable |
 
 ## Honest statement of scale
 
