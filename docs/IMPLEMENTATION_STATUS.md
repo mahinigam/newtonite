@@ -499,7 +499,7 @@ no route writes an event.
 | Models match migrations | `uv run alembic check` | Passed — `No new upgrade operations detected` (no new migration: the comment and activity indexes already existed) |
 | Query plans | `uv run python -m scripts.explain_lists` | Passed — 12 shapes, every one using an index; see `docs/DATA_MODEL.md` |
 | End-to-end over HTTP | `curl`-equivalent checks against the seeded database on a real `uvicorn` process | **67/67 checks passed** — see below |
-| CI (GitHub Actions) | run `RUN_ID` | Passed — every step green, including the 186-test suite against a `postgres:16` service container |
+| CI (GitHub Actions) | run `38977790902` | Passed — every step green, including the 186-test suite against a `postgres:16` service container |
 
 **End-to-end evidence against the real seeded dataset** (real Argon2id logins, real HTTP, a real
 server process, the seeded platform team):
@@ -545,7 +545,7 @@ first client that mixed the two up. Cursors now declare which id kind they carry
 site, so the mismatch is a `422` at the boundary. This is also what makes "activity paginates
 independently of item lists" enforced rather than merely intended.
 
-**Commit.** `PHASE5_SHA` on `feature/newtonite-operations-platform`. No history was rewritten.
+**Commit.** `136b491` on `feature/newtonite-operations-platform`. No history was rewritten.
 
 **Remaining gaps.** No frontend, so all of this is reachable only through HTTP. Comment editing
 and deletion do not exist by design. The e2e pass added three probe items to the development
