@@ -3,17 +3,18 @@
 Internal web application for creating, assigning, tracking, investigating, approving
 and resolving operational work across teams.
 
-The system is being built as one coherent vertical slice: a team-scoped work-item API
-with a server-enforced workflow, an append-only activity history, and explicit handling
-of concurrent and retried requests.
+The system is built as one coherent vertical slice: a team-scoped work-item API with a
+server-enforced workflow, an append-only activity history, explicit handling of concurrent
+and retried requests, and a React client that shows the server's answer rather than its own
+guess at it.
 
-> **Current status.** This repository is under active construction and the README is
-> kept in step with what actually runs. See
+> **Current status.** The vertical slice runs end to end: API, database and web application.
+> The README is kept in step with what actually runs. See
 > [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) for the honest
 > phase-by-phase state, and [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for
 > what is deliberately missing.
 
-## What works today (Phase 5 — comments, history and the correctness behaviours)
+## What works today (Phase 6 — the web application on top of a correct API)
 
 | Capability | Status |
 | --- | --- |
@@ -38,10 +39,15 @@ of concurrent and retried requests.
 | Comments on an item, idempotent and append-only, readable by any team member | Working |
 | Activity read API: one item's timeline and a team's feed, each with its own cursor | Working, read-only by construction |
 | Liveness (`/healthz`) and readiness (`/readyz`) endpoints | Working |
+| React + TypeScript web application (Vite, TanStack Query, strict types) | Working |
+| Sign-in, team switcher, item list with server-side filters and cursor paging | Working |
+| Item detail: claim, workflow moves, edit, comments, history — all server-confirmed | Working |
+| Team activity feed, paged with its own cursor | Working |
+| Loading, empty, error and conflict states on every server-backed view | Working |
 | Backend test suite against real PostgreSQL | Working (186 tests) |
+| Frontend test suite (vitest + React Testing Library) | Working (55 tests) |
 | Docker Compose PostgreSQL for reviewers | Working |
-| CI: formatting, lint, types, migrate, seed, tests | Working |
-| Frontend application | Not yet — see [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) |
+| CI: backend and frontend jobs, formatting, lint, types, migrate, seed, tests, build | Working |
 
 ## Technology stack
 
@@ -221,21 +227,35 @@ A comment and its `commented` history event are written in one transaction, so a
 cannot exist without the timeline entry that explains it. There is no route that writes an
 event — history is produced by the operations it describes.
 
-### 8. Run the API
+### 8. Run the API and the web app
+
+Two terminals, or `make dev-api` and `make dev-web`.
 
 ```bash
 cd backend
 uv run uvicorn app.main:app --reload --port 8000
 ```
 
-or `make dev-api`.
+```bash
+cd frontend
+npm ci
+npm run dev      # http://localhost:5173
+```
+
+Then open **http://localhost:5173** and sign in with any demo account from step 5.
 
 | URL | Purpose |
 | --- | --- |
+| http://localhost:5173 | The web application |
 | http://localhost:8000/healthz | Liveness |
 | http://localhost:8000/readyz | Readiness (performs a database round trip) |
 | http://localhost:8000/docs | OpenAPI UI |
 | http://localhost:8000/api/v1/openapi.json | OpenAPI schema |
+
+The browser talks to `VITE_API_BASE_URL` (default `http://localhost:8000`) directly. The
+backend lists the Vite origin in `CORS_ALLOWED_ORIGINS`, and the dev server uses
+`strictPort` so a port clash fails loudly instead of silently moving the browser to an
+origin the API does not allow. Both are covered in [`docs/FRONTEND.md`](docs/FRONTEND.md).
 
 ## Tests and quality checks
 
@@ -247,11 +267,20 @@ uv run ruff check .          # lint
 uv run mypy .                # strict static types
 ```
 
-From the repository root: `make test`, `make lint`, `make typecheck`, or `make check` for
-all of them.
+```bash
+cd frontend
+npm run test       # component tests (vitest + React Testing Library)
+npm run typecheck  # tsc --noEmit, strict
+npm run lint       # eslint
+npm run build      # production build
+```
 
-The suite runs against `TEST_DATABASE_URL` and applies migrations to head itself, so no
-manual preparation is needed beyond creating the empty `newtonite_test` database.
+From the repository root: `make test`, `make lint`, `make typecheck`, `make check` for all of
+them together, and `make build-web` for the production bundle.
+
+The backend suite runs against `TEST_DATABASE_URL` and applies migrations to head itself, so
+no manual preparation is needed beyond creating the empty `newtonite_test` database. The
+frontend suite needs no database: it stubs `fetch`, so it runs in about four seconds.
 
 ## Repository structure
 
@@ -271,10 +300,18 @@ backend/
     main.py           application factory
   scripts/            the demo seed, maintenance commands and the query-plan tool
   tests/              integration tests against PostgreSQL
+frontend/
+  src/
+    api/              the HTTP client and the response types
+    auth/             the in-memory session store, sign-in and sign-out
+    components/       the shell and the four view states
+    features/         one directory per view: items, activity
+    lib/              formatting, error explanations, the router, the role matrix
+    query/            the TanStack Query client, its keys and its invalidation helpers
+    test/             the fake network, fixtures and render helpers
 docker/
   initdb/             creates the test database on first Compose start
-docs/                 architecture, API, decisions, status and review material
-frontend/             React application (added in a later phase)
+docs/                 architecture, frontend, API, decisions, status and review material
 ```
 
 ## Documentation
@@ -284,6 +321,7 @@ frontend/             React application (added in a later phase)
 | [`docs/API.md`](docs/API.md) | Endpoints, authentication, error codes and worked examples |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Layers, request flow and where each rule lives |
 | [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) | Entities, integrity rules, indexes and measured query plans |
+| [`docs/FRONTEND.md`](docs/FRONTEND.md) | The web application: views, state model, retry policy, tests |
 | [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | Phase-by-phase status with verification evidence |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Configuration, migrations, diagnosis, safe resets |
 | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) | Decisions with context, options, trade-offs |
@@ -302,6 +340,11 @@ frontend/             React application (added in a later phase)
   `role` or `user_id` in a request body is never trusted — unknown fields are rejected.
 - A resource in a team the caller does not belong to returns `404`, not `403`, so responses
   cannot be used to confirm that another team's data exists.
+- The browser holds the session token **in memory only** — never in `localStorage` or
+  `sessionStorage`. The cost is real and accepted: a page reload signs you out. Web storage
+  is readable by any script on the page, so keeping the token out of it is the only option
+  where closing a tab destroys the credential. The reasoning, including why `HttpOnly`
+  cookies were not chosen, is in [`docs/SECURITY.md`](docs/SECURITY.md).
 - Not yet built and documented as such: login rate limiting, password reset, and MFA. See
   [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for the residual risk.
 

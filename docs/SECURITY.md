@@ -74,22 +74,30 @@ precisely.
 session expires or is revoked. Therefore the security of the token is the security of the page
 that holds it.
 
-**Where it will be stored.** The frontend keeps the token in memory and mirrors it to
-`sessionStorage` so a page reload does not sign the user out. **It is not put in
-`localStorage`.** The honest reason is limited: both are readable by JavaScript, so *neither
-defends against XSS*. The difference is lifetime and exposure: `localStorage` persists until
-explicitly cleared, so a token stolen once remains valid across browser restarts, while
-`sessionStorage` is discarded when the tab closes. Choosing the shorter-lived option reduces
-the window without pretending to solve the problem.
+**Where it is stored.** The token lives in a module variable in `frontend/src/api/client.ts`
+and is **never written to `localStorage` or `sessionStorage`**. The cost is real and is stated
+rather than glossed over: **a page reload signs the user out.**
 
-**What XSS would actually allow.** Injected script running on the application's origin can read
-`sessionStorage`, and could read the in-memory token directly by calling the API. It could also
-simply issue authenticated requests without ever reading the token. So the real defence is not
-token storage; it is:
+Both web-storage options are readable by JavaScript, so *neither defends against XSS* — the
+choice is only about how long a stolen token stays usable. `localStorage` persists until it is
+explicitly cleared, so a token captured once survives browser restarts. `sessionStorage` narrows
+that to the tab's lifetime. Keeping it in memory narrows it further, to the lifetime of the page,
+and is the only one of the three where closing a tab is sufficient to destroy the credential.
+
+The price is a reload. The session is already short-lived (12 h absolute, 2 h idle) and revocable,
+and the demo accounts are one click away on the sign-in screen, so the reload is the cheaper of
+the two prices. A different application — one where a lost page means lost work — could
+reasonably choose `sessionStorage` instead; the trade-off is recorded in
+`ENGINEERING_DECISIONS.md` rather than presented as a free win.
+
+**What XSS would actually allow.** Injected script running on the application's origin could
+read the in-memory token, and — more to the point — could simply issue authenticated requests
+without ever reading it. So the real defence is not token storage; it is:
 
 1. **Never render untrusted text as HTML.** Comment bodies, titles and descriptions are
-   inserted as text nodes. There is no `innerHTML` on user content and no HTML sanitiser to get
-   wrong.
+   inserted as text nodes by React. There is no `dangerouslySetInnerHTML` anywhere in the
+   frontend and no HTML sanitiser to get wrong, and no `meta` value from the activity feed is
+   interpreted as markup.
 2. **A strict `Content-Security-Policy`** in the deployed frontend (see `OPERATIONS.md`),
    which blocks inline and remote script. This is the control that actually stops injected
    script from executing.
@@ -102,14 +110,21 @@ configuration and care with cross-origin requests. The trades are:
 
 | Approach | XSS reads the credential | CSRF possible |
 | --- | --- | --- |
-| Bearer token in `sessionStorage` | Yes | No — the browser does not attach it automatically, and a cross-site form cannot set an `Authorization` header |
+| Bearer token in memory (this project) | Only while the page is open | No — the browser does not attach it automatically, and a cross-site form cannot set an `Authorization` header |
+| Bearer token in `sessionStorage` | Until the tab closes | No, for the same reason |
 | `HttpOnly` cookie | No | Yes, unless mitigated |
 
 Neither is strictly better, and this project chose the one whose weakness is mitigated by
 controls it actually implements (CSP, no HTML injection) over the one whose weakness requires
-additional machinery. The choice is recorded rather than presented as a free win. A production
-deployment with a high-value threat model should consider `HttpOnly` cookies with `SameSite=Strict`
-plus an anti-CSRF token.
+additional machinery. A production deployment with a high-value threat model should consider
+`HttpOnly` cookies with `SameSite=Strict` plus an anti-CSRF token.
+
+**Cross-origin requests are restricted, not assumed.** The API allows exactly one origin
+(`CORS_ALLOWED_ORIGINS`, default `http://localhost:5173`) and only the headers the application
+uses — `Authorization`, `Content-Type`, `Idempotency-Key`, `If-Match`. `allow_credentials` is
+`false`, which is correct for a bearer token that the browser must be told to send. The Vite dev
+server is configured with `strictPort: true` so a port clash fails loudly instead of silently
+moving the browser to an origin the API does not allow.
 
 **No CSRF tokens are required** with the current design, precisely because the browser never
 attaches the credential on its own.
@@ -119,7 +134,8 @@ attaches the credential on its own.
 | Risk | Current state | Mitigation if time allowed |
 | --- | --- | --- |
 | No login rate limiting or lockout | An attacker may attempt passwords without limit. Each attempt costs an Argon2id verification, which slows but does not prevent offline-speed guessing against a captured hash, and does not prevent distributed online guessing | Per-account and per-IP attempt counters with backoff, and alerting on spikes |
-| Token readable by script on the origin | See above | `HttpOnly` cookies with `SameSite=Strict` and an anti-CSRF token, or a tighter CSP with no third-party script |
+| Token readable by script on the origin while the page is open | See above. The in-memory choice removes the *persistence*, not the exposure | `HttpOnly` cookies with `SameSite=Strict` and an anti-CSRF token, or a tighter CSP with no third-party script |
+| A page reload ends the session | Deliberate consequence of in-memory storage: the user signs in again | `sessionStorage` if the reload cost outweighs the shortened exposure |
 | No MFA | Password-only | TOTP for admin and lead roles at minimum |
 | No password change, reset or rotation | Credentials are fixed by the seed; there is no user-creation endpoint, so there is nothing to reset yet | Password change with current-password confirmation, and a reset flow that invalidates existing sessions |
 | Sessions are not rotated on privilege change | A session carries no role of its own, so a role change takes effect on the next request rather than requiring a new login | That behaviour is arguably already correct; document it explicitly |

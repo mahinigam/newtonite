@@ -3,7 +3,7 @@
 This document states what the project does **not** do, why, and what it would take to
 address each item. It is updated every phase and reflects the code as pushed.
 
-Last updated: 2026-10-17 (end of Phase 5).
+Last updated: 2026-10-17 (end of Phase 6).
 
 ## Not built yet, by plan
 
@@ -12,7 +12,6 @@ nothing in the repository claims they work.
 
 | Area | Status | Planned phase |
 | --- | --- | --- |
-| Frontend application | Not implemented. Everything below is reachable over HTTP only | 6 |
 | Transactional outbox and worker | Not implemented; conditional on the core slice passing its gates | 7 |
 
 ## Deliberately excluded from scope
@@ -55,6 +54,12 @@ deferred.
 | A revoked or expired session is reported, but a stale role is not | A session carries no role of its own, so a role change applies from the next request rather than forcing a re-login. This is intended, not a defect | Documented in `SECURITY.md`; no change planned |
 | An item's comment thread and timeline are not searchable or filterable | There is no `q` or date filter on either activity view, so finding an old note means paging to it. A thread is short and a timeline is read in context, so the cost is low | Add the same `websearch_to_tsquery` filter the item list uses, over the comment body |
 | Activity rows are not pruned | `activity_events` grows with every mutation and is never archived. At demo scale it is thousands of rows; over years it would be the largest table | Partition by month, or archive closed items' history to cold storage |
+| A page reload signs the user out | The token is held in memory only, so the credential dies with the page. Deliberate: it is the only storage option where closing a tab destroys the token | `sessionStorage` if the reload cost outweighs the shorter exposure; `HttpOnly` cookies with `SameSite=Strict` plus an anti-CSRF token is the real production answer |
+| No member-management UI | The API supports adding, changing and removing members (admin only, with the last-admin and assigned-items rules enforced) but the interface has no screen for it. It is outside the work-item vertical slice | A team settings view; the endpoints and their tests already exist |
+| No optimistic updates | Claim, transitions and edits wait for the server. Chosen, not missing — see `ENGINEERING_DECISIONS.md` decision 19 | Nothing; an optimistic claim is a correctness regression |
+| The item list has no sort control | The order is the server's `(created_at, id)` descending keyset order, which is what a keyset cursor requires. A different order needs a different cursor | A second ordered index and a sort parameter, with the order encoded in the cursor's kind |
+| Frontend tests stub the network | They prove the components' behaviour, not the wire format. The wire format is covered by a separate contract check against a running API rather than by CI | A browser-driven end-to-end test (Playwright) against a seeded database, run in CI |
+| No frontend deployment configuration | There is no Dockerfile or static-hosting config for `dist/`. The build is verified (`npm run build`) but not deployed | A static host with the CSP from `OPERATIONS.md`, and the API origin configured |
 | Seeding is additive, not converging | Editing the generator does not change rows that already exist, so a stale local dataset needs a schema rebuild | A converging seed (`ON CONFLICT DO UPDATE`) once the item generator is stable |
 
 ## Honest statement of scale

@@ -823,6 +823,201 @@ HTTP, and `docs/DATA_MODEL.md` records the plan for each of the four lists.
 
 ---
 
+## 19. The interface holds server state, and contested writes are server-confirmed
+
+**Context.** The frontend has to display work items, let people claim them, move them through
+the workflow and edit them. TanStack Query makes optimistic updates easy, and the brief asks
+that "a mutation should return the authoritative server result" and that after a conflict the
+client "refresh/reconcile rather than forcing stale local data onto the server".
+
+**Options considered.**
+
+1. Optimistic updates everywhere: apply the change locally, send it, roll back on failure.
+2. No local state at all beyond the query cache; every write waits for the server.
+3. Optimistic for low-risk edits, server-confirmed for claim, approve and close.
+
+**Choice.** Option 3, but read strictly: **claim, transitions and edits are all
+server-confirmed.** Nothing on an item is optimistically updated. (Option 3's "low-risk" case
+turned out to have no members — see below.)
+
+**Why.** Option 1 is a correctness problem before it is a taste problem. Claim and approval are
+operations whose *entire point* is that exactly one caller wins: a claim that optimistically
+succeeds and then comes back `409` must be visibly undone in front of the user, and a transition
+that optimistically advances the status and then comes back `412` shows a workflow state that
+never existed on the server. That is worse than a button that waits, because it teaches the user
+to distrust the screen. Option 2 would be over-correction for a form: a title edit is not
+contested by anybody, so waiting for a round trip costs nothing and is what the code does anyway.
+
+Two related choices follow from this and are worth stating, because they are what make
+"server-confirmed" cheap rather than sluggish:
+
+- **A successful write's response is adopted rather than re-fetched.** The response *is* the new
+  state, so it goes straight into the item's cache entry. That removes a redundant `GET` and,
+  more importantly, means the interface can never show a locally invented result.
+- **The `ETag` is stored with the item, under one query key.** The version and the item are one
+  fact; keeping them in separate places is precisely how a client ends up conditioning a write
+  on yesterday's version while displaying today's data.
+
+A refused write does re-read the item, because then the local copy is *known* to be stale —
+which is the opposite of forcing stale local data onto the server.
+
+**Trade-offs.**
+
+- Accepted: a visible round-trip delay on every item write. On a local network it is a few
+  milliseconds; the button says what it is doing.
+- Accepted: no perceived speed win to demo. The win is that the screen never shows a state the
+  server did not confirm.
+- Accepted: more cache plumbing — `putItem`, `refreshItem` and `invalidateItemViews` rather than
+  one `invalidateQueries` call — because the two cases genuinely differ.
+
+**Consequences and verification.** `ItemDetailPage.test.tsx` asserts that a claim shows the
+assignee and the version **from the claim response** (and that no second read was needed), that
+a `409` is explained as "already taken" and re-reads the item, and that a `412` says the change
+"was not applied" and offers a reload. `ItemListPage.test.tsx` asserts that a filter change is a
+new server query rather than a filter over loaded rows.
+
+---
+
+## 20. The bearer token is held in memory, and a reload signs the user out
+
+**Context.** The API issues an opaque bearer token. The browser has to keep it somewhere, and
+every option is a trade the brief explicitly asks to be documented rather than assumed.
+
+**Options considered.**
+
+1. `localStorage` — survives everything.
+2. `sessionStorage` — survives a reload, dies with the tab.
+3. A module variable — survives neither.
+4. An `HttpOnly` cookie — unreadable by script, but sent automatically by the browser.
+
+**Choice.** Option 3. The token lives in `frontend/src/api/client.ts` and is written nowhere
+else.
+
+**Why.** The first thing to say plainly is that **none of 1–3 defends against XSS.** All three
+are readable by script running on the origin, so the choice is not "secure or insecure" — it is
+how long a stolen token stays usable. `localStorage` persists until explicitly cleared, so a
+token captured once survives browser restarts. `sessionStorage` narrows that to the tab.
+A module variable narrows it to the open page, and is the only option where closing a tab is
+sufficient to destroy the credential.
+
+Option 4 is the genuinely different one: script cannot read an `HttpOnly` cookie. But a cookie
+the browser attaches automatically is a CSRF vector, and closing that requires a token,
+`SameSite` configuration and care with cross-origin requests. The project chose the weakness it
+mitigates with controls it actually implements — no HTML injection anywhere, a strict CSP
+documented in `OPERATIONS.md`, short session lifetimes and immediate revocation — over the one
+that needs machinery it has not built. That reasoning, including why the alternatives are not
+simply "worse", is in `docs/SECURITY.md`.
+
+**Trade-offs.**
+
+- **Accepted, and it is a real cost: a page reload signs the user out.** The session is short
+  (12 h absolute, 2 h idle) and the demo accounts are one click away on the sign-in screen, so
+  the price is small — but it is a price, not a free win. An application where a lost page means
+  lost work should choose `sessionStorage` instead.
+- Accepted: no "remember me". There is no long-lived credential to remember.
+- Accepted: the interface must handle a `401` from anywhere, which it does in one place (the
+  query cache's `onError`).
+
+**Consequences and verification.** `client.test.ts` asserts the token is attached only once a
+session exists, and that a `401` is flagged as an authentication failure;
+`query/client.ts` turns that flag into a cleared session. `LoginPage.test.tsx` asserts that a
+failed sign-in leaves no session behind — including the case where the token is issued but the
+memberships cannot be read, which is the case a naive implementation gets wrong.
+
+---
+
+## 21. Retries are opt-in, and only where the server can recognise them
+
+**Context.** TanStack Query retries failed mutations by default. For this API that default is
+wrong in one direction and unhelpful in the other.
+
+**Options considered.**
+
+1. Retry all mutations.
+2. Retry none.
+3. Retry only the operations that carry an `Idempotency-Key`.
+
+**Choice.** Option 3. The default is `retry: 0`, and `CreateItemForm` and `CommentThread` opt in
+with `retry: 2`.
+
+**Why.** A retried claim, after the first attempt succeeded, comes back `409` — the item is now
+owned. A retried transition comes back `412` — the version moved. Retrying those does not make
+the application more reliable; it converts a successful operation into an error message. A
+retried create or comment is the opposite: the server holds an `Idempotency-Key` row and replays
+the original result, so the retry is *free* and the user never sees the blip.
+
+The subtlety that makes it work is where the key comes from. **It is a mutation variable,
+generated once when the user acts** — not inside the request function. TanStack reuses the
+variables for every attempt of the same mutation, so every attempt carries the same key and is
+the same logical operation. Generating the key inside `mutationFn` would give each retry a fresh
+key and turn a network blip into a duplicate work item, which is exactly the failure the API's
+required `Idempotency-Key` exists to prevent. This is a one-line difference with opposite
+outcomes, so it is asserted directly rather than assumed.
+
+Query retries are narrowed the same way: transport and `5xx` faults retry, `4xx` does not. A
+`403` will not become a `200`, and retrying an authentication failure only delays the sign-in
+screen.
+
+**Trade-offs.**
+
+- Accepted: a per-mutation override in two places, rather than one global setting.
+- Accepted: an automatic retry can still surprise a user who clicked once — but for these two
+  operations the second attempt cannot produce a second item, which is the whole point.
+- Accepted: no retry for edits, so a dropped connection during an edit is a visible failure the
+  user retries by hand. That is honest: the second attempt is a *new* conditional write, and
+  pretending otherwise would need a key on PATCH as well.
+
+**Consequences and verification.** `CommentThread.test.tsx` fails the first attempt at the
+transport layer and asserts the retry carries **the same** `Idempotency-Key` — the property a
+refactor would break silently. `ItemDetailPage.test.tsx` covers the two refusals that make
+retrying unsafe.
+
+---
+
+## 22. A hand-written router, and a deliberately small dependency list
+
+**Context.** The application has three views, one of which is nested inside another
+(`#/teams/:teamKey/items/:itemId`), and no server-side rendering.
+
+**Options considered.**
+
+1. `react-router-dom`.
+2. A hash router of about sixty lines.
+3. No routing: a single page with view state in React.
+
+**Choice.** Option 2.
+
+**Why.** A router library earns its place through data loaders, nested layouts, redirects and
+route-level code splitting. This application has none of those: there are three views, one
+nested route, and the data is fetched by TanStack Query from the item id in the URL. What is
+left is "parse the hash and subscribe to changes", which is a pure function plus
+`useSyncExternalStore` — and being a pure function, `parseHash` is tested directly, including the
+inputs that must be *refused* rather than guessed at (an item id that is not UUID-shaped is a
+`404`, not a request with a nonsense id).
+
+Option 3 fails a real requirement: a view has to be shareable and reloadable, which is also why
+the team comes from the URL rather than from component state.
+
+Hash routing rather than the History API is the same reasoning applied once more: it needs no
+server rewrite rule, so the built `dist/` is servable by any static file server.
+
+**Trade-offs.**
+
+- Accepted: no route-level code splitting, so the whole bundle loads at once. At 89 kB gzipped
+  for the entire application, splitting would add a network round trip to save less than the
+  latency it costs.
+- Accepted: hand-written parsing means hand-written edge cases, which is why the router has its
+  own test file covering the shapes that must not match.
+- Accepted: the dependency list stays at React, React DOM and TanStack Query at runtime. Every
+  other package is a build or test tool.
+
+**Consequences and verification.** `lib/router.test.ts` covers the two real routes, the landing
+hash, a non-UUID item id, a truncated path and a path with a trailing segment. `App.tsx` looks
+the team key up in the caller's own memberships and shows "that team is not one of yours" rather
+than an empty list, because the server would refuse every request for it anyway.
+
+---
+
 ## Decisions taken, not yet implemented
 
 Listed so the direction is explicit without implying that the behaviour exists.
@@ -830,5 +1025,5 @@ Listed so the direction is explicit without implying that the behaviour exists.
 | Decision | Direction | Implemented in |
 | --- | --- | --- |
 | Async notifications | PostgreSQL-backed transactional outbox with a `SKIP LOCKED` worker, bounded backoff, idempotent handling. Conditional on the core slice passing its gates first | Phase 7, not yet started |
-| Deliberately not built | Email, attachments, SSO, WebSockets, mobile, comment editing, reopen-after-close, rate limiting | See `docs/KNOWN_LIMITATIONS.md` |
+| Deliberately not built | Email, attachments, SSO, WebSockets, mobile, comment editing, reopen-after-close, rate limiting, member-management UI | See `docs/KNOWN_LIMITATIONS.md` |
 

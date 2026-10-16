@@ -4,7 +4,7 @@ A truthful, phase-by-phase record. "Verified" means the listed command was run a
 result observed in this repository — not that the code looks correct.
 
 **Branch:** `feature/newtonite-operations-platform`
-**Last updated:** 2026-10-17 (end of Phase 5)
+**Last updated:** 2026-10-17 (end of Phase 6)
 
 ## Phase summary
 
@@ -16,7 +16,7 @@ result observed in this repository — not that the code looks correct.
 | 3 | Authentication and team authorization | Complete | See below |
 | 4 | Work-item API and the five critical correctness behaviours | Complete | See below |
 | 5 | Comments API and activity history API | Complete | See below |
-| 6 | Frontend vertical slice | Not started | — |
+| 6 | Frontend vertical slice | Complete | See below |
 | 7 | Transactional outbox and worker (conditional) | Not started | Gate not yet assessed |
 | 8 | Final quality, documentation and reviewer readiness | Not started | — |
 
@@ -551,6 +551,114 @@ independently of item lists" enforced rather than merely intended.
 and deletion do not exist by design. The e2e pass added three probe items to the development
 database (3 009 items, 1 884 comments, 11 391 events in total); they are ordinary rows and the
 seed remains additive and idempotent.
+
+**Known defects.** None known.
+
+## Phase 6 — Frontend vertical slice
+
+**Requirements.** A React + TypeScript client that makes the API usable by a person: sign in,
+see a team's work items with server-side filters and paging, open an item, claim it, move it
+through the workflow, edit it, comment on it and read its history. Loading, empty, success and
+error states must all be represented, conflicts must be explained in the user's language, and
+the browser must never be the thing that decides what is allowed.
+
+**Acceptance criteria.** Every screen that loads server data shows all four states; filtering
+and paging are requests, not client-side work over a loaded page; claim, approve and close are
+server-confirmed and a `409`/`412` is explained with a way to recover; a viewer is offered no
+write control; a retried create or comment cannot produce a duplicate; and a `401` from any
+request returns the user to sign-in rather than to a broken page.
+
+**What was built.** A new Vite application under `frontend/`, with no runtime dependency beyond
+React and TanStack Query.
+
+| Area | Files |
+| --- | --- |
+| HTTP | `api/client.ts` (the error envelope, the `ETag`, the bearer token), `api/types.ts` |
+| Session | `auth/session.ts` (a store, not a context), `auth/auth.ts`, `auth/LoginPage.tsx` |
+| Shell | `App.tsx`, `components/Layout.tsx`, `components/states.tsx` |
+| Items | `ItemListPage`, `ItemFilters`, `ItemList`, `CreateItemForm`, `ItemDetailPage`, `ItemActions`, `ItemEditForm` |
+| Discussion and history | `CommentThread`, `ActivityTimeline` |
+| Team feed | `features/activity/TeamActivityPage.tsx` |
+| Shared | `lib/format.ts`, `lib/errors.ts`, `lib/permissions.ts`, `lib/router.ts`, `lib/idempotency.ts`, `query/client.ts` |
+| Tests | 7 files, `test/fetch.ts` (a recorded fake `fetch`), `test/fixtures.ts`, `test/render.tsx` |
+
+**Design details worth recording.** The full reasoning is in `docs/FRONTEND.md` and decisions
+19–22 in `ENGINEERING_DECISIONS.md`; the short version:
+
+- *Server state is the only state.* Filters and cursors are query parameters, so "show me every
+  unassigned urgent item" is correct rather than "…that happens to be in the loaded page".
+- *No optimistic updates on claim, approve, close or edit.* The answer is shown after the
+  server gives it. A rolled-back optimistic claim is a worse experience than a button that
+  waits.
+- *A write's response is adopted, and the `ETag` is stored with the item.* They are one fact.
+  After a save, the next conditional write is conditioned on the version the server just
+  produced, without an extra read.
+- *Retries are opt-in and only where the server can recognise them.* Create and comment retry,
+  because they carry an `Idempotency-Key` that is a mutation **variable**; claim, transition and
+  edit do not, because a retry after a success would be a `409` or a `412`.
+- *A `401` anywhere ends the session*, handled once in the query cache.
+- *The token is in memory only*, so a reload signs the user out. The trade-off is stated in
+  `SECURITY.md` rather than hidden behind a comment.
+- *The role matrix is mirrored but advisory.* The moves offered come from the server's
+  `available_transitions`; the mirror only decides which controls to draw.
+- *A hand-written hash router*, because there are three views and one nested route and a router
+  library is for the things this application does not have.
+
+**Verification.**
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Frontend tests | `npm run test` | Passed — **55 passed** in 7 files |
+| Type check | `npm run typecheck` | Passed — `tsc --noEmit`, strict, `noUncheckedIndexedAccess` |
+| Lint | `npm run lint` | Passed — `eslint .`, no warnings |
+| Production build | `npm run build` | Passed — 296.58 kB JS (89.24 kB gzip), 8.89 kB CSS (2.34 kB gzip) |
+| Backend tests (unchanged, re-run) | `uv run pytest -q` | Passed — 186 passed |
+| API contract over real HTTP | `uv run python` script against the seeded database and a real `uvicorn` process | **41/41 checks passed** — see below |
+| CORS preflight | `OPTIONS /api/v1/items` with `Origin: http://localhost:5173` | Passed — `access-control-allow-origin: http://localhost:5173`, allowing `Authorization`, `Content-Type`, `Idempotency-Key`, `If-Match` |
+| CI (GitHub Actions) | run `PHASE6_RUN_ID` | Passed — both jobs green |
+
+**The contract check, and why the component tests are not enough.** The frontend tests stub
+`fetch`, which is the right way to test a component but proves nothing about the wire format.
+So the same requests the browser makes were sent to the running API — same paths, same repeated
+query parameters, same headers — and checked:
+
+- `POST /auth/login` with the browser `Origin` returns `200` and an
+  `access-control-allow-origin` naming that origin.
+- `GET /teams/{id}/items` with **repeated** `status` parameters returns only rows matching any
+  of them, and a repeated `priority` narrows it further; the page envelope is exactly
+  `{items, next_cursor, has_more, limit}` and `limit` is echoed.
+- `assignee=none` returns only unassigned rows; `assignee=me` is empty before the claim and
+  contains the item afterwards.
+- `q=refund` is accepted and applied server-side.
+- `POST /teams/{id}/items` with an `Idempotency-Key` returns `201` with an `ETag`, and the
+  `ETag` is **exposed** through CORS (`access-control-expose-headers`) — without which the
+  browser could not read the header and every conditional write would be impossible.
+- `PATCH` with `If-Match` returns `200` and bumps the version once; the same `ETag` again
+  returns `412 stale_version`.
+- `POST /claim` makes the caller the assignee; `POST /transitions` advances the status and
+  returns a server-computed `available_transitions`.
+- `POST /comments` returns `201`; the thread and the item timeline both contain it, newest
+  first, with `created` last; the team feed contains the item.
+- `GET /teams/{uuid}/items` for an unknown team returns `404 not_found`.
+
+**A test bug found and fixed rather than worked around.** Four component tests failed on first
+run with "found multiple elements". The cause was not the components: `@testing-library/react`
+registers its own DOM cleanup through a global `afterEach`, and with `globals: false` it cannot
+find one, so every render stayed in `document.body` for the next test. The fix was an explicit
+`cleanup()` in the test setup — and the fact that the failure looked like a component bug is
+exactly why the tests were worth having.
+
+**A real bug the tests found.** `explainError` had its `validation_failed` branch inside a
+lookup that could never match that code, so field-level errors fell through to a generic
+sentence. The test that named the offending field failed, and the branch was moved. Without the
+test the bug would have shipped as slightly worse wording, which is the kind of defect that is
+never reported.
+
+**Commit.** `PHASE6_SHA` on `feature/newtonite-operations-platform`. No history was rewritten.
+
+**Remaining gaps.** No member-management UI (the API supports it, admin only). No offline
+support. The e2e contract check added one probe item to the development database, which is an
+ordinary row.
 
 **Known defects.** None known.
 

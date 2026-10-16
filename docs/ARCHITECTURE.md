@@ -134,6 +134,25 @@ not the discussion.
 | Which list a cursor belongs to | `decode_cursor(..., id_kind=...)` at each route | A cursor names a position in one ordered result set; the id kind is the discriminator that refuses a cursor from another list |
 | Comments are append-only | No route exists; the `activity_events` trigger covers history | A missing route cannot be bypassed, and the history behind a comment is protected by the database |
 
+## The frontend
+
+The client is a separate application with its own entry point, and it is documented in
+[`FRONTEND.md`](FRONTEND.md). The architectural facts that belong here are the ones that
+constrain the backend:
+
+- **It is not a second source of truth.** Every list, item, comment and event on screen came
+  from a response. Filtering, searching, ordering and paging are query parameters, and the
+  cursor is handed back verbatim. There is no code path that filters a loaded page.
+- **It holds no decision the server makes.** The moves an item offers are the server's
+  `available_transitions`, computed for the caller's role. The mirrored role matrix in
+  `frontend/src/lib/permissions.ts` decides which *controls to draw*, never what is allowed.
+- **It accepts the server's answer rather than inventing one.** A write's response is the new
+  state and is adopted directly; a refused write is explained and the item is re-read. There
+  are no optimistic updates on the operations whose point is that exactly one caller wins.
+- **The `ETag` is stored with the item, not beside it.** They are one fact — the version of
+  that item — and keeping them apart is how a client ends up sending an old version with new
+  data.
+
 ## Conventions
 
 - **Routers are thin.** A handler validates, calls one service function, and returns a

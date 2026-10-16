@@ -4,15 +4,23 @@
 # Every target wraps a documented command; run `make help` to list them.
 
 BACKEND := backend
+FRONTEND := frontend
 
-.PHONY: help setup db-up db-down migrate seed dev-api test test-api lint typecheck check
+.PHONY: help setup setup-api setup-web db-up db-down migrate seed \
+	dev-api dev-web test test-api test-web lint lint-api lint-web \
+	typecheck typecheck-api typecheck-web build-web check
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
-setup: ## Install backend dependencies from the lockfile
+setup: setup-api setup-web ## Install backend and frontend dependencies
+
+setup-api: ## Install backend dependencies from the lockfile
 	cd $(BACKEND) && uv sync --group dev
+
+setup-web: ## Install frontend dependencies from the lockfile
+	cd $(FRONTEND) && npm ci
 
 db-up: ## Start the docker-compose PostgreSQL (host port 5433)
 	docker compose up -d db
@@ -29,15 +37,34 @@ seed: ## Load deterministic demo data (idempotent; ITEMS=200 for a small set)
 dev-api: ## Run the API with autoreload on http://localhost:8000
 	cd $(BACKEND) && uv run uvicorn app.main:app --reload --port 8000
 
+dev-web: ## Run the frontend dev server on http://localhost:5173
+	cd $(FRONTEND) && npm run dev
+
+test: test-api test-web ## Run every test suite
+
 test-api: ## Run the backend test suite against PostgreSQL
 	cd $(BACKEND) && uv run pytest -q
 
-test: test-api ## Run every test suite
+test-web: ## Run the frontend test suite
+	cd $(FRONTEND) && npm run test
 
-lint: ## Format check and lint the backend
+lint: lint-api lint-web ## Lint both projects
+
+lint-api: ## Format check and lint the backend
 	cd $(BACKEND) && uv run ruff format --check . && uv run ruff check .
 
-typecheck: ## Static type check the backend
+lint-web: ## Lint the frontend
+	cd $(FRONTEND) && npm run lint
+
+typecheck: typecheck-api typecheck-web ## Static type check both projects
+
+typecheck-api: ## Static type check the backend
 	cd $(BACKEND) && uv run mypy .
+
+typecheck-web: ## Static type check the frontend
+	cd $(FRONTEND) && npm run typecheck
+
+build-web: ## Build the frontend for production (into frontend/dist)
+	cd $(FRONTEND) && npm run build
 
 check: lint typecheck test ## Run every quality gate
