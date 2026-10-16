@@ -753,7 +753,8 @@ in priority order, starting with the notification channel the deferred outbox is
 | Migration drift | `uv run alembic check` | "No new upgrade operations detected" |
 | Real-HTTP contract check | script against the seeded database and a real `uvicorn` process | **41/41 checks passed** |
 | CORS preflight | `OPTIONS /api/v1/items` with the Vite origin | Passed |
-| CI (GitHub Actions) | run [`38980249711`](https://github.com/mahinigam/newtonite/actions/runs/38980249711) | Passed — both jobs green |
+| End-to-end pass on the merged `main` | The Phase 5 suite (67 checks) and the Phase 6 contract suite (41 checks) re-run against a server started from `main` | **108/108 passed** |
+| CI (GitHub Actions) on `main` | run [`38980884416`](https://github.com/mahinigam/newtonite/actions/runs/38980884416) | Passed — both jobs green |
 
 **What was not weakened to get here.** No test was skipped, deleted or relaxed, and no
 assertion was rewritten to match observed behaviour. The two bugs found during verification
