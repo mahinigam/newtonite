@@ -2,7 +2,7 @@
 
 The database is the authoritative source of truth. This document describes what is
 stored, which rules the database itself enforces, why each index exists, and measured
-query behaviour. It reflects migration `0001_initial_schema`.
+query behaviour. It reflects migrations `0001_initial_schema` and `0002_team_created_index`.
 
 ## Entities
 
@@ -63,58 +63,149 @@ the table; ordinary `UPDATE` and `DELETE` are refused.
 | Index | Serves |
 | --- | --- |
 | `ix_work_items_team_status_created` on `(team_id, status, created_at DESC, id DESC)` | Team-scoped item lists filtered by status, newest first. The workhorse for the list and dashboard views |
+| `ix_work_items_team_created` on `(team_id, created_at DESC, id DESC)` | The same list **without** a status filter — the default view of a team's work. Added in revision `0002` after measuring that the index above cannot serve it (its second column is `status`, so there is nothing to seek on after `team_id`) |
 | `ix_work_items_assignee_created` on `(assignee_id, created_at DESC, id DESC)` | "Assigned to me" across the teams the caller belongs to |
 | `ix_work_items_unassigned_urgent` on `(team_id, created_at DESC, id DESC) WHERE assignee_id IS NULL AND status = 'open' AND priority IN ('high','urgent')` | The unassigned-urgent queue. Partial so it stays small and only covers rows that queue can return |
 | `ix_work_items_search_vector` (GIN) | Full-text search over title + description |
-| `ix_activity_events_work_item_id_created_at` on `(work_item_id, created_at DESC, id DESC)` | One item's timeline, newest first |
-| `ix_activity_events_team_id_created_at` on `(team_id, created_at DESC, id DESC)` | Team-scoped recent activity, and the authorization check for activity reads |
-| `ix_comments_work_item_id_created_at` on `(work_item_id, created_at, id)` | One item's comment thread, oldest first |
+| `ix_activity_events_work_item_id_created_at` on `(work_item_id, created_at DESC, id DESC)` | One item's timeline, newest first — the item activity endpoint |
+| `ix_activity_events_team_id_created_at` on `(team_id, created_at DESC, id DESC)` | A team's recent activity feed, newest first. Also the reason the feed needs no join back to `work_items` |
+| `ix_comments_work_item_id_created_at` on `(work_item_id, created_at, id)` | One item's comment thread. Declared ascending because that is the natural way to write it; the API reads it newest-first, which is the same index read backwards (or, for the handful of rows an item actually has, a bitmap scan of those rows and a tiny sort) |
 | `ix_memberships_user_id` on `(user_id)` | "Which teams does this user belong to" — the prefix the composite unique constraint cannot answer |
 | `ix_auth_sessions_user_id` on `(user_id)` | Token lookup and "revoke every session for this user" |
 
-Every list index ends in `id DESC` so the ordering is a total order: two items created in
-the same millisecond still have exactly one correct position. That is what makes keyset
-pagination stable.
+Every list index ends in `id` (descending, except the comment thread's ascending
+declaration) so the ordering is a total order: two items created in the same millisecond
+still have exactly one correct position. That is what makes keyset pagination stable — and
+it is not a theoretical concern, because a row inserted inside a transaction shares that
+transaction's `now()`, which is how the pagination tests are built.
 
-### Why the unassigned-urgent index leads with `team_id`
+### When the partial unassigned-urgent index applies
 
-The dashboard queue is always scoped to one team, so a leading `team_id` lets the index
-both filter and order. A cross-team version of that query (no `team_id` predicate) can
-still use the index for filtering but has to sort the result, which is the correct
-trade-off for a queue that is normally viewed one team at a time.
+The two queue rows above are the same feature asked two different ways, and they are worth
+reading together.
+
+`ix_work_items_unassigned_urgent` is partial, covering only rows where
+`assignee_id IS NULL AND status = 'open' AND priority IN ('high','urgent')`. A partial
+index can only serve a query that proves the partial predicate holds, so it is used when
+the request filters on all three — the "unassigned urgent open work" queue — and it is
+about 2.5× faster there (0.31 ms against 0.82 ms) with a much smaller index to read.
+
+When the same queue is asked **without** constraining `status` (all unassigned urgent items,
+whatever their state), the planner cannot use it and falls back to
+`ix_work_items_team_created`, which is correct: the broader question genuinely has to
+consider more rows. Both plans are recorded rather than only the flattering one.
+
+The index leads with `team_id` because the queue is always scoped to one team, so a leading
+`team_id` lets the index filter and order together. A cross-team version of the query with
+no `team_id` predicate can still filter with it but has to sort.
 
 ## Measured behaviour
 
 Data: the seed's default dataset of **3 000 work items**, **11 356 activity events**,
-**1 878 comments**, 12 users and 14 memberships, after `ANALYZE`. Timings are a single
-local run on the development machine — they are evidence that the indexes are used and
-the plans are bounded, not a performance claim.
+**1 878 comments**, 12 users and 14 memberships. Timings are a single local run on the
+development machine — they are evidence that the indexes are used and the plans are
+bounded, not a performance claim. They vary by roughly ±50% between runs, and more on the
+first run after a restart, so the **plan shape** is the durable part of each row and the
+milliseconds are not.
 
-| Query | Plan | Rows | Time |
+Reproduce with:
+
+```bash
+uv run python -m scripts.explain_lists
+```
+
+That script imports the statement builders from the service layer — `list_statement`,
+`comment_list_statement`, `item_activity_statement`, `team_activity_statement` — so the
+SQL it explains is the SQL the API executes. Filters, ordering and the cursor all go
+through the same builders; a hand-written lookalike would drift the first time a filter
+was added.
+
+| Query, as the API issues it | Plan | Time |
+| --- | --- | --- |
+| Team list, no filter (the default team view) | `Index Scan using ix_work_items_team_created` | **0.23 ms** |
+| Team list, filtered by status | `Index Scan using ix_work_items_team_status_created` | **0.15 ms** |
+| Team list, filtered by status **and** priority | `Bitmap Index Scan on ix_work_items_team_status_created`, top-N sort | **0.67 ms** |
+| Queue: unassigned high-or-urgent items, any status | `Bitmap Index Scan on ix_work_items_team_created` | **0.62 ms** |
+| Queue: unassigned high-or-urgent **open** items | `Bitmap Index Scan on ix_work_items_unassigned_urgent` (the partial index), top-N sort | **0.17 ms** |
+| "Assigned to me" | `BitmapAnd` of `ix_work_items_assignee_created` and `ix_work_items_team_created` | **0.28 ms** |
+| Full-text search | `Bitmap Index Scan on ix_work_items_search_vector` | **0.10 ms** |
+| Team list, deep page by cursor (300 rows skipped) | `Index Scan using ix_work_items_team_created`, 301 rows removed by filter | **0.30 ms** |
+| One item's comment thread, newest first | `Bitmap Index Scan on ix_comments_work_item_id_created_at` | **0.04 ms** |
+| One item's timeline, newest first | `Bitmap Index Scan on ix_activity_events_work_item_id_created_at` | **0.05 ms** |
+| Team activity feed, first page | `Index Scan using ix_activity_events_team_id_created_at` | **0.05 ms** |
+| Team activity feed, deep page by cursor (half the feed skipped) | `Index Scan using ix_activity_events_team_id_created_at`, 1 426 rows removed by filter | **0.82 ms** |
+
+Every list query also resolves the assignee, creator or actor through `Memoize`d
+primary-key lookups on `users`, so one page costs one lookup per distinct person, not one
+per row. The plan for the first item page completes with 44 buffer hits and no sort node.
+
+The two item-scoped rows above are the same shape as each other and are deliberately
+reported as they are: the seed's longest thread has three comments and its longest
+timeline nine events, so the planner chooses a bitmap scan of exactly those rows and sorts
+a handful, which is cheaper than walking an index backwards for so few rows. The index is
+still what bounds the work — the alternative would be reading the whole table. The team
+feed is where the deep-page measurement is meaningful, because it is the list with
+thousands of rows behind it.
+
+### An index added because a measurement asked for it
+
+The first version of this table had no unfiltered team row, and that was the bug: the
+default team view was a **sequential scan of the whole table plus a top-N sort** at
+3.19 ms, against 0.32 ms for the same list narrowed by status. The cause was structural
+rather than a matter of size — `ix_work_items_team_status_created` leads with `team_id`
+but its next column is `status`, so a query that does not constrain `status` can seek to
+the team and then has nothing to walk in order. It would have stayed a full scan at any
+size.
+
+`ix_work_items_team_created` fixes it, and is also exactly the ordering the keyset cursor
+walks. Measured before and after adding it, in one sitting on the same data: **3.19 ms →
+0.53 ms**, with the sequential scan gone. (The absolute figure drifts between runs as the
+table above explains; the before/after comparison is what this paragraph is evidence for,
+and it is a same-session comparison of the same query.)
+
+### What keyset pagination does and does not buy
+
+The cursor is a position in `(created_at DESC, id DESC)` rather than an offset, so an item
+created while somebody is reading page 1 cannot shift a later page — page 2 continues from
+where page 1 stopped. That property is asserted in `tests/test_items_list.py` by creating
+rows between two page requests.
+
+The honest limit: the cursor predicate is written in its expanded `OR`/`AND` form and the
+plan applies it as a **filter** after seeking to the team in the index, so a deeper page
+walks past the rows it is skipping (301 of them for page 13, all inside the index, no heap
+fetches). Cost therefore grows with page depth rather than being constant. It remains
+strictly better than `OFFSET`, which would additionally read and discard the page's heap
+tuples, and at the seeded size the whole query is under a millisecond.
+
+### Full-text search, measured properly
+
+Searching is the case most likely to be misreported, because the plan depends on how the
+statement is prepared. All four of these are measured on the same dataset for the term
+`timeout`, which matches 140 items:
+
+| How the statement is issued | Text-search config | Index condition | Time |
 | --- | --- | --- | --- |
-| Team list, filtered by status, newest first | `Index Scan using ix_work_items_team_status_created` | 25 (limit) | **0.18 ms** |
-| "Assigned to me", newest first | `Index Scan using ix_work_items_assignee_created` | 25 (limit) | **0.18 ms** |
-| Unassigned high/urgent open items | `Bitmap Index Scan on ix_work_items_unassigned_urgent`, then 25-row top-N sort | 194 matched | **0.66 ms** |
-| Deep keyset page (~4 000 rows skipped) | `Index Only Scan using ix_work_items_team_status_created`, `Heap Fetches: 0` | 25 (limit) | **0.39 ms** |
-| One item's timeline | `Bitmap Index Scan on ix_activity_events_work_item_id_created_at` | 8 | **0.06 ms** |
-| Full-text search for `timeout` | **Sequential scan** (planner's choice), 2 812 rows removed by filter | 140 matched | 1.21 ms |
-| The same search with sequential scans discouraged | `Bitmap Index Scan on ix_work_items_search_vector` | 140 matched | 0.28 ms |
+| Values inlined (`EXPLAIN` on the compiled statement) | literal | `search_vector @@ '''timeout'''::tsquery` | **0.16 ms** |
+| Prepared statement, custom plan (values known) | literal | `search_vector @@ websearch_to_tsquery('english'::regconfig, $2)` | **0.17 ms** |
+| Prepared statement, **forced generic plan** | literal | `search_vector @@ websearch_to_tsquery('english'::regconfig, $2)` | **0.245 ms** |
+| Prepared statement, **forced generic plan** | **parameter** | `search_vector @@ websearch_to_tsquery($2, $3)` | **5.47 ms** |
 
-The keyset row is the important one: skipping thousands of rows costs the same as reading
-the first page, because there is no `OFFSET` to scan through.
+The last row is the one worth reading. It still shows a `Bitmap Index Scan`, which would
+look like success in a screenshot, but the index condition is the function call itself:
+with the configuration passed as a parameter, PostgreSQL cannot evaluate the tsquery once
+and instead re-evaluates `websearch_to_tsquery` for **every index entry** it considers.
+Same plan *shape*, about 20× the work.
 
-### An honest note on full-text search at this size
+That is why `SEARCH_CONFIG` in `app/services/work_items.py` is written as the literal
+`'english'::regconfig` rather than a bound value. Using a literal for a fixed internal
+constant is what allows the tsquery to be evaluated once. Nothing user-supplied is
+interpolated — the search term itself is always a bound parameter.
 
-At 3 000 rows — roughly 50 pages of heap — PostgreSQL prefers a sequential scan for full
-text search even when the term matches only 5% of rows, and it is right to: reading 50
-pages sequentially is cheaper than a bitmap index scan plus 100 heap block fetches. The
-forced comparison above shows the GIN index is correct and about 4× faster in isolation,
-but the planner is entitled to ignore it at this scale.
-
-So the accurate statement is: **the GIN index is built for search and is used when the
-table is large enough for the planner to prefer it; at the seeded size it does not.**
-No claim of faster search is made at 3 000 rows. The design is sized for the brief's
-tens-of-thousands-of-items case, and that has not been measured.
+Unlike the earlier revision of this document, the GIN index **is** used by the planner at
+3 000 rows. The previous measurement reported a sequential scan; that was measured against
+a different query shape, and the claim was corrected to match the plan rather than kept for
+consistency. No claim is made about behaviour at the brief's tens-of-thousands-of-items
+target, which has not been measured.
 
 ## What the schema deliberately does not do
 

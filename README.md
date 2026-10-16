@@ -3,17 +3,18 @@
 Internal web application for creating, assigning, tracking, investigating, approving
 and resolving operational work across teams.
 
-The system is being built as one coherent vertical slice: a team-scoped work-item API
-with a server-enforced workflow, an append-only activity history, and explicit handling
-of concurrent and retried requests.
+The system is built as one coherent vertical slice: a team-scoped work-item API with a
+server-enforced workflow, an append-only activity history, explicit handling of concurrent
+and retried requests, and a React client that shows the server's answer rather than its own
+guess at it.
 
-> **Current status.** This repository is under active construction and the README is
-> kept in step with what actually runs. See
+> **Current status.** The vertical slice runs end to end: API, database and web application.
+> The README is kept in step with what actually runs. See
 > [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) for the honest
 > phase-by-phase state, and [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for
 > what is deliberately missing.
 
-## What works today (Phase 2 — domain, integrity and demo data)
+## What works today (Phase 6 — the web application on top of a correct API)
 
 | Capability | Status |
 | --- | --- |
@@ -23,12 +24,49 @@ of concurrent and retried requests.
 | Schema for users, teams, memberships, work items, comments, activity events, sessions, idempotency keys | Working |
 | Database-enforced invariants (team/assignee consistency, append-only history, value sets) | Working, tested |
 | Deterministic, idempotent demo seed (~3 000 work items, 12 users, 4 teams) | Working |
-| Index inventory matched to query patterns, with measured plans | Working — see [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) |
+| Indexes matched to query patterns, with measured plans | Working — see [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) |
+| Login, logout and session validation (Argon2id, hashed tokens, absolute + idle expiry, revocation) | Working |
+| Per-team authorization with an explicit role matrix, enforced on the server | Working |
+| Teams, membership and roster endpoints; admin-only role management | Working |
+| One error envelope: `400` / `401` / `403` / `404` / `409` / `412` / `422` / `428` with stable codes | Working |
+| Work-item create, read, edit and list, all authorized against team membership | Working |
+| Server-side filtering (`status`, `priority`, `type`, `assignee=me\|none`), full-text search, keyset pagination | Working |
+| Atomic claim — two concurrent claims produce at most one owner | Working, tested concurrently |
+| Stale-update rejection: `If-Match` required (`428`), stale writes refused (`412`) | Working, tested |
+| Idempotent creation via a required `Idempotency-Key`, safe under retry and concurrency | Working, tested concurrently |
+| Server-enforced workflow with per-transition role permissions; `status` not patchable | Working |
+| Activity history written in the same transaction as every mutation | Working, tested by breaking the insert on purpose |
+| Comments on an item, idempotent and append-only, readable by any team member | Working |
+| Activity read API: one item's timeline and a team's feed, each with its own cursor | Working, read-only by construction |
 | Liveness (`/healthz`) and readiness (`/readyz`) endpoints | Working |
-| Backend test suite against real PostgreSQL | Working (33 tests) |
+| React + TypeScript web application (Vite, TanStack Query, strict types) | Working |
+| Sign-in, team switcher, item list with server-side filters and cursor paging | Working |
+| Item detail: claim, workflow moves, edit, comments, history — all server-confirmed | Working |
+| Team activity feed, paged with its own cursor | Working |
+| Loading, empty, error and conflict states on every server-backed view | Working |
+| Backend test suite against real PostgreSQL | Working (186 tests) |
+| Frontend test suite (vitest + React Testing Library) | Working (55 tests) |
 | Docker Compose PostgreSQL for reviewers | Working |
-| CI: formatting, lint, types, migrate, seed, tests | Working |
-| Authentication, work-item API, workflow, frontend | Not yet — see [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) |
+| CI: backend and frontend jobs, formatting, lint, types, migrate, seed, tests, build | Working |
+
+## Where to look first
+
+The assessment asks for meaningful behaviour beyond CRUD. Five such behaviours are
+implemented and tested. Each row below names the behaviour, the test that proves it, and
+the document that explains the reasoning — so a reviewer can check the claim rather than
+take it on trust.
+
+| Behaviour | The test that proves it | The reasoning |
+| --- | --- | --- |
+| **Two concurrent claims produce at most one owner** | `tests/test_claim.py`, `tests/test_items_concurrency.py` — two `POST /claim` calls are issued concurrently on separate connections; exactly one returns `200` | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) 5, [`docs/API.md`](docs/API.md) |
+| **A write based on a stale version is refused, not applied** | `tests/test_items_update.py`, `tests/test_transitions.py` — a `PATCH` with an old `ETag` returns `412` and the stored row is unchanged | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) 6 |
+| **A retried request cannot create a duplicate** | `tests/test_items_create.py`, `tests/test_comments.py` — the same `Idempotency-Key` twice creates one row and replays the first result; a different payload under the same key returns `409` | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) 7 |
+| **Workflow and role rules are enforced on the server** | `tests/test_transitions.py`, `tests/test_authorization.py` — invalid transitions are refused, a viewer cannot write, and another team's item is a `404` | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) 8, 11, 12 |
+| **History cannot diverge from the state it describes** | `tests/test_activity_atomicity.py` — the activity insert is broken on purpose and the item mutation rolls back with it | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) 9 |
+
+A one-command check of the first four, over real HTTP against the seeded database, is in
+[`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) (Phase 4 and Phase 5
+sections) — the scripts are not committed, but the commands and the observed results are.
 
 ## Technology stack
 
@@ -137,25 +175,106 @@ These are **development placeholders, not secrets**, and they exist so a reviewe
 exercise every role without creating accounts. `sam.multi` deliberately holds a different
 role in each of two teams — the case a per-team role model has to get right.
 
-> The login endpoint arrives with the authentication phase, so these accounts are in the
-> database but not yet reachable over HTTP. See
-> [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md).
+Try it without a client:
 
-### 6. Run the API
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"sam.multi@newtonite.dev","password":"Newtonite!2026"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+
+curl -s http://localhost:8000/api/v1/auth/me    -H "Authorization: Bearer $TOKEN"
+curl -s http://localhost:8000/api/v1/teams      -H "Authorization: Bearer $TOKEN"
+```
+
+`/auth/me` returns the caller's role in each team, which is how the frontend knows what to
+offer. It is advisory to the interface only — every write is authorized again on the server.
+The full endpoint list is in [`docs/API.md`](docs/API.md).
+
+### 6. Create, claim and move a work item
+
+The three headers that carry the correctness guarantees, in one sequence. Everything below
+runs against a seeded database; replace `<TEAM_ID>` with a team from `/auth/me`.
+
+```bash
+# Create — Idempotency-Key is required, so a retry cannot make a second item.
+ITEM=$(curl -s -X POST "http://localhost:8000/api/v1/teams/<TEAM_ID>/items" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"title":"Refund the duplicate charge","type":"payment","priority":"urgent"}')
+echo "$ITEM"                       # 201, with an ETag
+ID=$(echo "$ITEM" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# Claim — atomic. No If-Match: the race is decided by assignee_id IS NULL inside the UPDATE.
+curl -s -X POST "http://localhost:8000/api/v1/items/$ID/claim" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Edit — If-Match is required. Send the ETag you last saw, or get 428 / 412.
+curl -s -X PATCH "http://localhost:8000/api/v1/items/$ID" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H 'If-Match: "2"' -d '{"priority":"high"}'
+
+# Move it. There is no endpoint that writes status directly.
+curl -s -X POST "http://localhost:8000/api/v1/items/$ID/transitions" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H 'If-Match: "3"' -d '{"to":"in_progress"}'
+
+# List, filtered and paged on the server.
+curl -s "http://localhost:8000/api/v1/teams/<TEAM_ID>/items?assignee=none&priority=urgent&limit=5" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### 7. Comment on an item and read its history
+
+```bash
+# Comment — Idempotency-Key is required, so a double-click cannot post the note twice.
+curl -s -X POST "http://localhost:8000/api/v1/items/$ID/comments" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"body":"Root cause was the 22:00 deploy."}'
+
+# Read the thread, newest first. Each list has its own cursor.
+curl -s "http://localhost:8000/api/v1/items/$ID/comments?limit=25" \
+  -H "Authorization: Bearer $TOKEN"
+
+# The item's timeline, and the whole team's feed. Both are read-only.
+curl -s "http://localhost:8000/api/v1/items/$ID/activity" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8000/api/v1/teams/<TEAM_ID>/activity" -H "Authorization: Bearer $TOKEN"
+```
+
+A comment and its `commented` history event are written in one transaction, so a comment
+cannot exist without the timeline entry that explains it. There is no route that writes an
+event — history is produced by the operations it describes.
+
+### 8. Run the API and the web app
+
+Two terminals, or `make dev-api` and `make dev-web`.
 
 ```bash
 cd backend
 uv run uvicorn app.main:app --reload --port 8000
 ```
 
-or `make dev-api`.
+```bash
+cd frontend
+npm ci
+npm run dev      # http://localhost:5173
+```
+
+Then open **http://localhost:5173** and sign in with any demo account from step 5.
 
 | URL | Purpose |
 | --- | --- |
+| http://localhost:5173 | The web application |
 | http://localhost:8000/healthz | Liveness |
 | http://localhost:8000/readyz | Readiness (performs a database round trip) |
 | http://localhost:8000/docs | OpenAPI UI |
 | http://localhost:8000/api/v1/openapi.json | OpenAPI schema |
+
+The browser talks to `VITE_API_BASE_URL` (default `http://localhost:8000`) directly. The
+backend lists the Vite origin in `CORS_ALLOWED_ORIGINS`, and the dev server uses
+`strictPort` so a port clash fails loudly instead of silently moving the browser to an
+origin the API does not allow. Both are covered in [`docs/FRONTEND.md`](docs/FRONTEND.md).
 
 ## Tests and quality checks
 
@@ -167,11 +286,20 @@ uv run ruff check .          # lint
 uv run mypy .                # strict static types
 ```
 
-From the repository root: `make test`, `make lint`, `make typecheck`, or `make check` for
-all of them.
+```bash
+cd frontend
+npm run test       # component tests (vitest + React Testing Library)
+npm run typecheck  # tsc --noEmit, strict
+npm run lint       # eslint
+npm run build      # production build
+```
 
-The suite runs against `TEST_DATABASE_URL` and applies migrations to head itself, so no
-manual preparation is needed beyond creating the empty `newtonite_test` database.
+From the repository root: `make test`, `make lint`, `make typecheck`, `make check` for all of
+them together, and `make build-web` for the production bundle.
+
+The backend suite runs against `TEST_DATABASE_URL` and applies migrations to head itself, so
+no manual preparation is needed beyond creating the empty `newtonite_test` database. The
+frontend suite needs no database: it stubs `fetch`, so it runs in about four seconds.
 
 ## Repository structure
 
@@ -179,23 +307,40 @@ manual preparation is needed beyond creating the empty `newtonite_test` database
 backend/
   alembic/            migration environment and revisions
   app/
-    api/              FastAPI routers (thin HTTP layer)
+    api/              FastAPI routers (thin HTTP layer) and dependencies
     models/           SQLAlchemy ORM models and domain enums
+    policy/           the role matrix, the authenticated principal and the workflow
+    schemas/          request and response models, separate from the ORM
+    security/         password hashing and session tokens
+    services/         business rules, testable without a request
     config.py         environment-driven settings
     db.py             async engine and session management
+    errors.py         error types and the HTTP error envelope
     main.py           application factory
+  scripts/            the demo seed, maintenance commands and the query-plan tool
   tests/              integration tests against PostgreSQL
+frontend/
+  src/
+    api/              the HTTP client and the response types
+    auth/             the in-memory session store, sign-in and sign-out
+    components/       the shell and the four view states
+    features/         one directory per view: items, activity
+    lib/              formatting, error explanations, the router, the role matrix
+    query/            the TanStack Query client, its keys and its invalidation helpers
+    test/             the fake network, fixtures and render helpers
 docker/
   initdb/             creates the test database on first Compose start
-docs/                 architecture, decisions, status and review material
-frontend/             React application (added in a later phase)
+docs/                 architecture, frontend, API, decisions, status and review material
 ```
 
 ## Documentation
 
 | Document | Contents |
 | --- | --- |
+| [`docs/API.md`](docs/API.md) | Endpoints, authentication, error codes and worked examples |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Layers, request flow and where each rule lives |
 | [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) | Entities, integrity rules, indexes and measured query plans |
+| [`docs/FRONTEND.md`](docs/FRONTEND.md) | The web application: views, state model, retry policy, tests |
 | [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | Phase-by-phase status with verification evidence |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Configuration, migrations, diagnosis, safe resets |
 | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) | Decisions with context, options, trade-offs |
@@ -204,11 +349,54 @@ frontend/             React application (added in a later phase)
 ## Security notes
 
 - No secrets are committed. `.env.example` contains placeholders only.
-- Passwords are hashed with Argon2id and `auth_sessions` stores only a SHA-256 digest of
-  a session token, never the token itself. The schema enforces this today; the code that
-  uses it lands with the authentication phase — see
-  [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md).
-- Authorization is enforced on the server; the UI never decides permissions.
+- Passwords are hashed with Argon2id. Session tokens are 256 bits of randomness and are
+  stored **only** as a SHA-256 digest, so a database disclosure does not yield usable
+  sessions. A fast digest is used here deliberately, because a random token cannot be brute
+  forced; passwords get a memory-hard KDF because they can be.
+- Sessions have both an absolute lifetime (12 h) and an idle lifetime (2 h), and logout
+  revokes immediately. Expiry is evaluated with the database clock, not the application's.
+- Authorization is enforced on the server, per team, from stored memberships. A `team_id`,
+  `role` or `user_id` in a request body is never trusted — unknown fields are rejected.
+- A resource in a team the caller does not belong to returns `404`, not `403`, so responses
+  cannot be used to confirm that another team's data exists.
+- The browser holds the session token **in memory only** — never in `localStorage` or
+  `sessionStorage`. The cost is real and accepted: a page reload signs you out. Web storage
+  is readable by any script on the page, so keeping the token out of it is the only option
+  where closing a tab destroys the credential. The reasoning, including why `HttpOnly`
+  cookies were not chosen, is in [`docs/SECURITY.md`](docs/SECURITY.md).
+- Not yet built and documented as such: login rate limiting, password reset, and MFA. See
+  [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for the residual risk.
 
 Deployment caveats, including the recommended `Content-Security-Policy`, are documented
 in [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+
+## Next week I would…
+
+In rough priority order, and stated as work rather than wishes:
+
+1. **Give the outbox something to deliver, then build it.** A notification channel — "you were
+   assigned", "your item was approved", "your item was sent back" — as email or a webhook.
+   The transactional outbox is only worth building once something is listening, which is why
+   it was deferred with a design sketch rather than half-built; see the Phase 7 assessment in
+   [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md).
+2. **Browser-driven end-to-end tests in CI.** Playwright against a seeded database, signing in
+   as each role and exercising the claim, approval, comment, conflict and refusal paths. The
+   frontend tests stub the network, and the wire format was verified by a script run by hand —
+   that should be a permanent gate, not a one-off.
+3. **Login rate limiting and lockout.** Per-account and per-IP attempt counters with backoff and
+   alerting on spikes. This is the largest remaining security gap and the only one that is a
+   realistic attack rather than a residual risk.
+4. **A member-management screen.** The API is complete and tested — adding, changing and
+   removing members, admin only, with the last-admin and assigned-items rules enforced — but the
+   interface has no view for it.
+5. **Reopen-after-close**, with an explicit authorization rule, a reason, and a history event.
+   `CLOSED` is terminal today, which is a deliberate simplification rather than a permanent
+   answer.
+6. **Deployment**: a container image for the API, a static host for the built `dist/` with the
+   recommended CSP, and TLS termination in front of both.
+7. **Measure at a larger scale.** The plans are measured at 3 000 items; a bigger seed with
+   `EXPLAIN (ANALYZE, BUFFERS)` would show where the current indexes stop being sufficient, and
+   would turn "bounded and indexed" into a number.
+8. **Kind-tagged or signed cursors**, if a paginated position ever becomes something a user can
+   share or edit. Today a cursor is opaque but unsigned, which is correct for a
+   server-generated position and would not be for a URL.

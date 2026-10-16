@@ -35,6 +35,10 @@ from app.models.enums import IdempotencyStatus, check_in
 # SHA-256 rendered as lower-case hex.
 FINGERPRINT_LENGTH = 64
 
+# The storage limit for a client-supplied key, enforced by the column below and checked
+# at the API boundary so an over-long key is a `422` rather than a database error.
+KEY_MAX_LENGTH = 255
+
 
 class IdempotencyKey(Base):
     __tablename__ = "idempotency_keys"
@@ -49,7 +53,7 @@ class IdempotencyKey(Base):
     # the actor *and* the operation: two different endpoints can use the same
     # key string without colliding.
     operation: Mapped[str] = mapped_column(String(64), nullable=False)
-    key: Mapped[str] = mapped_column(String(255), nullable=False)
+    key: Mapped[str] = mapped_column(String(KEY_MAX_LENGTH), nullable=False)
 
     # Digest of the request body. A different body under the same key is a
     # client bug and must not return the first request's result.
@@ -76,4 +80,4 @@ class IdempotencyKey(Base):
         return f"<IdempotencyKey {self.operation}:{self.key} {self.status}>"
 
 
-__all__ = ["FINGERPRINT_LENGTH", "IdempotencyKey"]
+__all__ = ["FINGERPRINT_LENGTH", "KEY_MAX_LENGTH", "IdempotencyKey"]

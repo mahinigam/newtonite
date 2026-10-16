@@ -64,6 +64,9 @@ express it.
 | Tests wipe unexpected data | `TEST_DATABASE_URL` points at a database you care about. Stop, fix the URL, and restore from a backup |
 | `alembic check` reports differences | A model changed without a migration (or vice versa). Create a revision and review it |
 | `activity_events is append-only` | Something tried to `UPDATE`/`DELETE` history. That is the intended behaviour |
+| Login works, then every request returns `401 session_expired` | The session hit its absolute or idle lifetime. Lifetimes are `SESSION_ABSOLUTE_TTL_HOURS` / `SESSION_IDLE_TTL_HOURS`; check the host clock, because a large skew from the database makes freshly issued sessions look stale |
+| Login returns `401 invalid_credentials` for an account you can see in `psql` | The password is wrong, or the account is deactivated (`is_active = false`). The response is deliberately identical in both cases |
+| A user's role change does not take effect | It does, from their next request — roles are read from `memberships` every request and are not stored in the session |
 | Port 5432 already in use by Compose | Compose is mapped to 5433 precisely to avoid this; check `.env` |
 
 Logs are written to standard error at the level set by `LOG_LEVEL`. Set `LOG_LEVEL=DEBUG`
@@ -102,11 +105,64 @@ If a credential is ever exposed:
 
 1. Rotate it in the source system. Deleting a file from the latest commit does **not**
    remove it from Git history — rotate first, then clean history if required.
-2. Revoke affected sessions:
+2. Revoke the affected sessions. All sessions, with SQL:
    ```sql
    UPDATE auth_sessions SET revoked_at = now() WHERE revoked_at IS NULL;
    ```
-   Revocation takes effect on the next request; sessions are not cached in process.
+   Or one account, with the maintenance command:
+
+   ```bash
+   cd backend
+   uv run python -m scripts.maintenance revoke-sessions --email ada.admin@newtonite.dev
+   ```
+
+   Revocation takes effect on the next request; sessions are validated against the
+   database every time and are never cached in the process, so no restart is needed.
+
+### Session housekeeping
+
+Expired sessions are refused on read, so they cost correctness nothing — only space:
+
+```bash
+cd backend
+uv run python -m scripts.maintenance purge-expired-sessions
+```
+
+This deletes sessions that expired more than a week ago and reports how many remain,
+leaving recent rows in place so a support question about a session can still be answered
+from the table. It is the only code path that deletes from `auth_sessions`; nothing
+expires a session by deleting it.
+
+### Idempotency keys
+
+`idempotency_keys` rows are not history and are not read after the retry window a client
+would reasonably use. There is **no automatic pruning**; the table grows with creation
+traffic. It is safe to delete old keys — a deleted key means only that a retry long after
+the fact would create a second item, which is exactly why the window should exceed the
+longest a client would retry:
+
+```sql
+-- Keep a week of retry protection; adjust to the client's retry budget.
+DELETE FROM idempotency_keys WHERE created_at < now() - interval '7 days';
+```
+
+Nothing on the read path consults this table, so pruning cannot break an existing item.
+
+## Measuring query plans
+
+The performance claims in [`DATA_MODEL.md`](DATA_MODEL.md) are reproducible rather than
+asserted:
+
+```bash
+cd backend
+uv run python -m scripts.explain_lists
+```
+
+It prints `EXPLAIN (ANALYZE, BUFFERS)` for the seven list shapes the API actually issues,
+against whatever is in the connected database. It imports the service layer's
+`list_statement`, so the SQL it explains is the SQL the API runs. Run it against the seeded
+database — on an empty table every plan is a sequential scan, because an index cannot win
+when there is nothing to walk past.
 
 ## Deployment caveats
 
