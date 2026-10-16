@@ -354,6 +354,7 @@ view is filtered and paged in PostgreSQL with a bounded page size.
 | Models match migrations | `uv run alembic check` | Passed — `No new upgrade operations detected` |
 | Query plans | `uv run python -m scripts.explain_lists` | All seven shapes use an index; see `docs/DATA_MODEL.md` |
 | End-to-end over HTTP | `curl` against the seeded database on a real `uvicorn` process | **49/49 checks passed** — see below |
+| CI (GitHub Actions) | run `38973882659` | Passed — every step green, including the 154-test suite against a `postgres:16` service container |
 
 **End-to-end evidence against the real seeded dataset** (3 000 items, 12 accounts, real
 Argon2id logins, real HTTP, a real server process):
@@ -417,6 +418,8 @@ text-search configuration was being passed as a bound parameter, which under a g
 made PostgreSQL re-evaluate `websearch_to_tsquery` for every index entry — 5.47 ms against
 0.245 ms with the same plan shape. Both are documented with their numbers in
 `docs/DATA_MODEL.md`.
+
+**Commit.** `545c2cb` on `feature/newtonite-operations-platform`. No history was rewritten.
 
 **Remaining gaps.** Comments and the activity read API do not exist yet, so history is written
 and inspectable only through `psql`. No frontend. Reopening a closed item is refused by
