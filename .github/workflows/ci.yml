@@ -19,7 +19,10 @@ concurrency:
 jobs:
   backend:
     name: Backend (lint, types, tests)
-    runs-on: ubuntu-latest
+    # Pinned rather than `ubuntu-latest`: the latest label is scheduled to move
+    # to Ubuntu 26 during the assessment window, and a silent base-image change
+    # in the middle of it is an avoidable variable.
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
