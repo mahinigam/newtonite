@@ -2,7 +2,7 @@
 
 The database is the authoritative source of truth. This document describes what is
 stored, which rules the database itself enforces, why each index exists, and measured
-query behaviour. It reflects migration `0001_initial_schema`.
+query behaviour. It reflects migrations `0001_initial_schema` and `0002_team_created_index`.
 
 ## Entities
 
@@ -67,15 +67,17 @@ the table; ordinary `UPDATE` and `DELETE` are refused.
 | `ix_work_items_assignee_created` on `(assignee_id, created_at DESC, id DESC)` | "Assigned to me" across the teams the caller belongs to |
 | `ix_work_items_unassigned_urgent` on `(team_id, created_at DESC, id DESC) WHERE assignee_id IS NULL AND status = 'open' AND priority IN ('high','urgent')` | The unassigned-urgent queue. Partial so it stays small and only covers rows that queue can return |
 | `ix_work_items_search_vector` (GIN) | Full-text search over title + description |
-| `ix_activity_events_work_item_id_created_at` on `(work_item_id, created_at DESC, id DESC)` | One item's timeline, newest first |
-| `ix_activity_events_team_id_created_at` on `(team_id, created_at DESC, id DESC)` | Team-scoped recent activity, and the authorization check for activity reads |
-| `ix_comments_work_item_id_created_at` on `(work_item_id, created_at, id)` | One item's comment thread, oldest first |
+| `ix_activity_events_work_item_id_created_at` on `(work_item_id, created_at DESC, id DESC)` | One item's timeline, newest first — the item activity endpoint |
+| `ix_activity_events_team_id_created_at` on `(team_id, created_at DESC, id DESC)` | A team's recent activity feed, newest first. Also the reason the feed needs no join back to `work_items` |
+| `ix_comments_work_item_id_created_at` on `(work_item_id, created_at, id)` | One item's comment thread. Declared ascending because that is the natural way to write it; the API reads it newest-first, which is the same index read backwards (or, for the handful of rows an item actually has, a bitmap scan of those rows and a tiny sort) |
 | `ix_memberships_user_id` on `(user_id)` | "Which teams does this user belong to" — the prefix the composite unique constraint cannot answer |
 | `ix_auth_sessions_user_id` on `(user_id)` | Token lookup and "revoke every session for this user" |
 
-Every list index ends in `id DESC` so the ordering is a total order: two items created in
-the same millisecond still have exactly one correct position. That is what makes keyset
-pagination stable.
+Every list index ends in `id` (descending, except the comment thread's ascending
+declaration) so the ordering is a total order: two items created in the same millisecond
+still have exactly one correct position. That is what makes keyset pagination stable — and
+it is not a theoretical concern, because a row inserted inside a transaction shares that
+transaction's `now()`, which is how the pagination tests are built.
 
 ### When the partial unassigned-urgent index applies
 
@@ -102,7 +104,9 @@ no `team_id` predicate can still filter with it but has to sort.
 Data: the seed's default dataset of **3 000 work items**, **11 356 activity events**,
 **1 878 comments**, 12 users and 14 memberships. Timings are a single local run on the
 development machine — they are evidence that the indexes are used and the plans are
-bounded, not a performance claim. They vary by roughly ±50% between runs.
+bounded, not a performance claim. They vary by roughly ±50% between runs, and more on the
+first run after a restart, so the **plan shape** is the durable part of each row and the
+milliseconds are not.
 
 Reproduce with:
 
@@ -110,24 +114,38 @@ Reproduce with:
 uv run python -m scripts.explain_lists
 ```
 
-That script imports `list_statement` from `app/services/work_items.py`, so the SQL it
-explains is the SQL the API executes. Filters, ordering and the cursor all go through the
-same builder; a hand-written lookalike would drift the first time a filter was added.
+That script imports the statement builders from the service layer — `list_statement`,
+`comment_list_statement`, `item_activity_statement`, `team_activity_statement` — so the
+SQL it explains is the SQL the API executes. Filters, ordering and the cursor all go
+through the same builders; a hand-written lookalike would drift the first time a filter
+was added.
 
 | Query, as the API issues it | Plan | Time |
 | --- | --- | --- |
-| Team list, no filter (the default team view) | `Index Scan using ix_work_items_team_created` | **0.53 ms** |
-| Team list, filtered by status | `Index Scan using ix_work_items_team_status_created` | **0.32 ms** |
-| Team list, filtered by status **and** priority | `Bitmap Index Scan on ix_work_items_team_status_created`, top-N sort | **1.43 ms** |
-| Queue: unassigned high-or-urgent items, any status | `Bitmap Index Scan on ix_work_items_team_created` | **0.82 ms** |
-| Queue: unassigned high-or-urgent **open** items | `Bitmap Index Scan on ix_work_items_unassigned_urgent` (the partial index), top-N sort | **0.31 ms** |
-| "Assigned to me" | `BitmapAnd` of `ix_work_items_assignee_created` and `ix_work_items_team_created` | **0.63 ms** |
-| Full-text search | `Bitmap Index Scan on ix_work_items_search_vector` | **0.16 ms** |
-| Deep page by cursor (300 rows skipped) | `Index Scan using ix_work_items_team_created`, 301 rows removed by filter | **0.67 ms** |
+| Team list, no filter (the default team view) | `Index Scan using ix_work_items_team_created` | **0.23 ms** |
+| Team list, filtered by status | `Index Scan using ix_work_items_team_status_created` | **0.15 ms** |
+| Team list, filtered by status **and** priority | `Bitmap Index Scan on ix_work_items_team_status_created`, top-N sort | **0.67 ms** |
+| Queue: unassigned high-or-urgent items, any status | `Bitmap Index Scan on ix_work_items_team_created` | **0.62 ms** |
+| Queue: unassigned high-or-urgent **open** items | `Bitmap Index Scan on ix_work_items_unassigned_urgent` (the partial index), top-N sort | **0.17 ms** |
+| "Assigned to me" | `BitmapAnd` of `ix_work_items_assignee_created` and `ix_work_items_team_created` | **0.28 ms** |
+| Full-text search | `Bitmap Index Scan on ix_work_items_search_vector` | **0.10 ms** |
+| Team list, deep page by cursor (300 rows skipped) | `Index Scan using ix_work_items_team_created`, 301 rows removed by filter | **0.30 ms** |
+| One item's comment thread, newest first | `Bitmap Index Scan on ix_comments_work_item_id_created_at` | **0.04 ms** |
+| One item's timeline, newest first | `Bitmap Index Scan on ix_activity_events_work_item_id_created_at` | **0.05 ms** |
+| Team activity feed, first page | `Index Scan using ix_activity_events_team_id_created_at` | **0.05 ms** |
+| Team activity feed, deep page by cursor (half the feed skipped) | `Index Scan using ix_activity_events_team_id_created_at`, 1 426 rows removed by filter | **0.82 ms** |
 
-Every list query also resolves the assignee and creator through `Memoize`d primary-key
-lookups on `users`, so one page costs one lookup per distinct person, not one per row.
-The plan for the first page completes with 48 buffer hits and no sort node.
+Every list query also resolves the assignee, creator or actor through `Memoize`d
+primary-key lookups on `users`, so one page costs one lookup per distinct person, not one
+per row. The plan for the first item page completes with 44 buffer hits and no sort node.
+
+The two item-scoped rows above are the same shape as each other and are deliberately
+reported as they are: the seed's longest thread has three comments and its longest
+timeline nine events, so the planner chooses a bitmap scan of exactly those rows and sorts
+a handful, which is cheaper than walking an index backwards for so few rows. The index is
+still what bounds the work — the alternative would be reading the whole table. The team
+feed is where the deep-page measurement is meaningful, because it is the list with
+thousands of rows behind it.
 
 ### An index added because a measurement asked for it
 
@@ -140,7 +158,10 @@ the team and then has nothing to walk in order. It would have stayed a full scan
 size.
 
 `ix_work_items_team_created` fixes it, and is also exactly the ordering the keyset cursor
-walks. Measured after adding it: **3.19 ms → 0.53 ms**, with the sequential scan gone.
+walks. Measured before and after adding it, in one sitting on the same data: **3.19 ms →
+0.53 ms**, with the sequential scan gone. (The absolute figure drifts between runs as the
+table above explains; the before/after comparison is what this paragraph is evidence for,
+and it is a same-session comparison of the same query.)
 
 ### What keyset pagination does and does not buy
 

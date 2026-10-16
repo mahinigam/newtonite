@@ -16,10 +16,12 @@ Deliberate shortcuts, with reasons:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from app.models import Comment, Membership, Team, User, WorkItem
-from app.models.enums import Priority, Role, Status, WorkItemType
+from app.models import ActivityEvent, Comment, Membership, Team, User, WorkItem
+from app.models.enums import ActivityType, Priority, Role, Status, WorkItemType
 from app.security.passwords import hash_password
 from httpx import AsyncClient, Response
 from sqlalchemy import text
@@ -227,6 +229,223 @@ async def api_patch(
 ) -> Response:
     headers = etag_headers(token, etag) if etag is not None else auth_headers(token)
     return await client.patch(f"/api/v1/items/{item_id}", json=fields, headers=headers)
+
+
+COMMENTS_URL = "/api/v1/items/{item_id}/comments"
+ITEM_ACTIVITY_URL = "/api/v1/items/{item_id}/activity"
+TEAM_ACTIVITY_URL = "/api/v1/teams/{team_id}/activity"
+
+
+async def api_comment(
+    client: AsyncClient,
+    *,
+    token: str,
+    item_id: str,
+    body: str = "Looks like a bad deploy.",
+    key: str | None = None,
+    omit_key: bool = False,
+) -> Response:
+    """POST a comment.
+
+    A fresh `Idempotency-Key` is generated unless one is supplied, so the common case is
+    retry-safe; `omit_key=True` suppresses the header entirely, which is what the test for
+    the missing-key refusal needs.
+    """
+    headers = auth_headers(token) if omit_key else idempotency_headers(token, key)
+    return await client.post(
+        COMMENTS_URL.format(item_id=item_id), json={"body": body}, headers=headers
+    )
+
+
+async def comment_ok(
+    client: AsyncClient, *, token: str, item_id: str, body: str = "Noted."
+) -> dict[str, Any]:
+    response = await api_comment(client, token=token, item_id=item_id, body=body)
+    assert response.status_code == 201, response.text
+    result: dict[str, Any] = response.json()
+    return result
+
+
+async def read_comments(
+    client: AsyncClient,
+    *,
+    token: str,
+    item_id: str,
+    cursor: str | None = None,
+    limit: int | None = None,
+) -> Response:
+    params: dict[str, Any] = {}
+    if cursor is not None:
+        params["cursor"] = cursor
+    if limit is not None:
+        params["limit"] = limit
+    return await client.get(
+        COMMENTS_URL.format(item_id=item_id), params=params, headers=auth_headers(token)
+    )
+
+
+async def read_items(
+    client: AsyncClient,
+    *,
+    token: str,
+    team_id: uuid.UUID,
+    cursor: str | None = None,
+    limit: int | None = None,
+) -> Response:
+    params: dict[str, Any] = {}
+    if cursor is not None:
+        params["cursor"] = cursor
+    if limit is not None:
+        params["limit"] = limit
+    return await client.get(
+        ITEMS_URL.format(team_id=team_id), params=params, headers=auth_headers(token)
+    )
+
+
+async def read_item_activity(
+    client: AsyncClient,
+    *,
+    token: str,
+    item_id: str,
+    cursor: str | None = None,
+    limit: int | None = None,
+) -> Response:
+    params: dict[str, Any] = {}
+    if cursor is not None:
+        params["cursor"] = cursor
+    if limit is not None:
+        params["limit"] = limit
+    return await client.get(
+        ITEM_ACTIVITY_URL.format(item_id=item_id), params=params, headers=auth_headers(token)
+    )
+
+
+async def read_team_activity(
+    client: AsyncClient,
+    *,
+    token: str,
+    team_id: uuid.UUID,
+    cursor: str | None = None,
+    limit: int | None = None,
+) -> Response:
+    params: dict[str, Any] = {}
+    if cursor is not None:
+        params["cursor"] = cursor
+    if limit is not None:
+        params["limit"] = limit
+    return await client.get(
+        TEAM_ACTIVITY_URL.format(team_id=team_id), params=params, headers=auth_headers(token)
+    )
+
+
+async def walk_pages(
+    fetch: Callable[..., Awaitable[Response]], *, limit: int, max_pages: int = 50
+) -> list[dict[str, Any]]:
+    """Follow `next_cursor` until it runs out, returning every row in order.
+
+    Paging is where a keyset implementation fails quietly — a duplicate or a skipped row
+    only shows up when the pages are stitched back together — so tests collect the whole
+    walk and assert on it.
+    """
+    rows: list[dict[str, Any]] = []
+    cursor: str | None = None
+    for _ in range(max_pages):
+        response = await fetch(cursor=cursor, limit=limit)
+        assert response.status_code == 200, response.text
+        page = response.json()
+        rows.extend(page["items"])
+        cursor = page["next_cursor"]
+        if not page["has_more"]:
+            assert cursor is None, "the last page must not offer a cursor"
+            break
+        assert cursor is not None, "a page with more rows must offer a cursor"
+    else:  # pragma: no cover - a walk that never ends is a bug, not a test failure
+        raise AssertionError(f"paging did not finish within {max_pages} pages")
+    return rows
+
+
+async def count_comments(session: AsyncSession, item_id: uuid.UUID) -> int:
+    return int(
+        (
+            await session.execute(
+                text("SELECT count(*) FROM comments WHERE work_item_id = :id"),
+                {"id": item_id},
+            )
+        ).scalar_one()
+    )
+
+
+async def count_events(session: AsyncSession, item_id: uuid.UUID) -> int:
+    return int(
+        (
+            await session.execute(
+                text("SELECT count(*) FROM activity_events WHERE work_item_id = :id"),
+                {"id": item_id},
+            )
+        ).scalar_one()
+    )
+
+
+async def insert_comments(
+    session: AsyncSession,
+    *,
+    item_id: uuid.UUID,
+    author_id: uuid.UUID,
+    bodies: list[str],
+    spaced: bool = False,
+) -> None:
+    """Insert comments directly, in one transaction.
+
+    Used by the pagination tests, which need a *long* list rather than a meaningful one.
+
+    ``spaced=False`` (the default) lets every row share the transaction's `now()`, so the
+    order can only be right if the `id` tie-breaker is part of the keyset — the case a
+    test that created comments one request at a time would never reach. ``spaced=True``
+    gives each row a distinct, increasing timestamp, which is what makes "newest first"
+    a deterministic claim rather than a race against the clock.
+    """
+    base = datetime.now(UTC) - timedelta(days=1)
+    for index, body in enumerate(bodies):
+        comment = Comment(id=uuid.uuid4(), work_item_id=item_id, author_id=author_id, body=body)
+        if spaced:
+            comment.created_at = base + timedelta(seconds=index)
+        session.add(comment)
+    # Committed, not merely flushed: the API reads through its own connection, so rows
+    # that only exist in this session's uncommitted transaction would be invisible.
+    await session.commit()
+
+
+async def insert_events(
+    session: AsyncSession,
+    *,
+    item_id: uuid.UUID,
+    team_id: uuid.UUID,
+    actor_id: uuid.UUID,
+    count: int,
+    spaced: bool = False,
+) -> None:
+    """Insert history rows directly, for the same reason as `insert_comments`.
+
+    The default makes every row share one `created_at`, so reading them back in the right
+    order proves the `id` tie-breaker rather than a lucky timestamp.
+    """
+    base = datetime.now(UTC) - timedelta(days=1)
+    for index in range(count):
+        event = ActivityEvent(
+            work_item_id=item_id,
+            team_id=team_id,
+            actor_id=actor_id,
+            event_type=ActivityType.PRIORITY_CHANGED.value,
+            from_value=f"step {index}",
+            to_value=f"step {index + 1}",
+            meta={},
+        )
+        if spaced:
+            event.created_at = base + timedelta(seconds=index)
+        session.add(event)
+    # Committed for the same reason as `insert_comments`: the API cannot see an
+    # uncommitted transaction on another connection.
+    await session.commit()
 
 
 async def activity_events(session: AsyncSession, item_id: uuid.UUID) -> list[dict[str, Any]]:

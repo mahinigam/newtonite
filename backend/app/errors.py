@@ -189,8 +189,8 @@ class IdempotencyKeyRequired(AppError):
     status_code = 400
     code = "idempotency_key_required"
     message = (
-        "Creating a work item requires an 'Idempotency-Key' header, so that a retry "
-        "cannot create a duplicate."
+        "This request requires an 'Idempotency-Key' header, so that a retry cannot "
+        "create a duplicate."
     )
 
 

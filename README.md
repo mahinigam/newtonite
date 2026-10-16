@@ -13,7 +13,7 @@ of concurrent and retried requests.
 > phase-by-phase state, and [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for
 > what is deliberately missing.
 
-## What works today (Phase 4 — work-item API and the correctness behaviours)
+## What works today (Phase 5 — comments, history and the correctness behaviours)
 
 | Capability | Status |
 | --- | --- |
@@ -34,12 +34,14 @@ of concurrent and retried requests.
 | Stale-update rejection: `If-Match` required (`428`), stale writes refused (`412`) | Working, tested |
 | Idempotent creation via a required `Idempotency-Key`, safe under retry and concurrency | Working, tested concurrently |
 | Server-enforced workflow with per-transition role permissions; `status` not patchable | Working |
-| Activity history written in the same transaction as every mutation | Working — reads arrive in Phase 5 |
+| Activity history written in the same transaction as every mutation | Working, tested by breaking the insert on purpose |
+| Comments on an item, idempotent and append-only, readable by any team member | Working |
+| Activity read API: one item's timeline and a team's feed, each with its own cursor | Working, read-only by construction |
 | Liveness (`/healthz`) and readiness (`/readyz`) endpoints | Working |
-| Backend test suite against real PostgreSQL | Working (154 tests) |
+| Backend test suite against real PostgreSQL | Working (186 tests) |
 | Docker Compose PostgreSQL for reviewers | Working |
 | CI: formatting, lint, types, migrate, seed, tests | Working |
-| Comments API, activity read API, frontend | Not yet — see [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) |
+| Frontend application | Not yet — see [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) |
 
 ## Technology stack
 
@@ -197,7 +199,29 @@ curl -s "http://localhost:8000/api/v1/teams/<TEAM_ID>/items?assignee=none&priori
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### 7. Run the API
+### 7. Comment on an item and read its history
+
+```bash
+# Comment — Idempotency-Key is required, so a double-click cannot post the note twice.
+curl -s -X POST "http://localhost:8000/api/v1/items/$ID/comments" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"body":"Root cause was the 22:00 deploy."}'
+
+# Read the thread, newest first. Each list has its own cursor.
+curl -s "http://localhost:8000/api/v1/items/$ID/comments?limit=25" \
+  -H "Authorization: Bearer $TOKEN"
+
+# The item's timeline, and the whole team's feed. Both are read-only.
+curl -s "http://localhost:8000/api/v1/items/$ID/activity" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8000/api/v1/teams/<TEAM_ID>/activity" -H "Authorization: Bearer $TOKEN"
+```
+
+A comment and its `commented` history event are written in one transaction, so a comment
+cannot exist without the timeline entry that explains it. There is no route that writes an
+event — history is produced by the operations it describes.
+
+### 8. Run the API
 
 ```bash
 cd backend

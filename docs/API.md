@@ -3,9 +3,10 @@
 Base path: `/api/v1`. The generated OpenAPI schema is served at `/api/v1/openapi.json` and a
 browsable UI at `/docs`.
 
-**This document lists what is implemented.** Work items, their filters, pagination, claiming
-and the approval workflow are implemented. Comments and the activity *read* API are not yet;
-they are tracked in [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
+**This document lists what is implemented.** Work items, their filters, pagination, claiming,
+the approval workflow, comments and the activity read API are implemented. The frontend and
+the outbox worker are not yet; they are tracked in
+[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
 
 ## Authentication
 
@@ -348,8 +349,7 @@ a state change. If the history write fails, the mutation rolls back — proven b
 asserts the item is byte-unchanged afterwards.
 
 Fields changed by one request produce one event each (in a fixed field order) while bumping
-the version **once**. The activity API itself arrives in Phase 5; until then history is
-written but not yet readable over HTTP.
+the version **once**. History is readable through the two endpoints below.
 
 
 ### `GET /users/directory?query=`
@@ -361,6 +361,106 @@ max 100 characters). A caller cannot use it to enumerate accounts outside their 
 ```json
 [{ "id": "…", "email": "…", "display_name": "…" }]
 ```
+
+## Comments
+
+Comments are addressed through the item they belong to. A comment has no meaning outside its
+item, and the item's own row is what the team is derived from — the caller is authorized
+against that, never against a team id the client sent.
+
+Reading requires `VIEW_TEAM`; writing requires `COMMENT` (member and above). The author and
+the item come from the session and the path, so neither can be claimed by a client.
+
+### `POST /items/{item_id}/comments` — requires `Idempotency-Key`
+
+```json
+{ "body": "Root cause was the 22:00 deploy." }
+```
+
+`201 Created` for the request that created the comment, `200 OK` with
+`Idempotent-Replay: true` for a replay of the same request. The same key with a **different
+body** is `409 idempotency_key_reuse` rather than a silent replay of the first comment — the
+key identifies one logical operation, not a slot to overwrite.
+
+| Refusal | Status | Code |
+| --- | --- | --- |
+| No `Idempotency-Key` header | `400` | `idempotency_key_required` |
+| Empty after stripping, or over 4 000 characters | `422` | `validation_failed` (`details[0].field == "body"`) |
+| Viewer | `403` | `forbidden` |
+| Item in a team the caller is not in, or an id that was never issued | `404` | `not_found` |
+
+The body is stripped **before** the length is checked, so `"   "` is a `422` naming the
+field rather than a database error later. The stored body is the stripped value.
+
+Commenting on a **closed** item is allowed and deliberate: closure ends the workflow, not the
+discussion. A comment changes no field of the item, so it does not bump `version`.
+
+### `GET /items/{item_id}/comments`
+
+Newest first, paged with its own cursor. Each comment is:
+
+```json
+{
+  "id": "…",
+  "work_item_id": "…",
+  "body": "Root cause was the 22:00 deploy.",
+  "author": { "id": "…", "email": "…", "display_name": "…" },
+  "created_at": "2026-10-17T09:14:02.118000Z"
+}
+```
+
+Comments are append-only: there is no edit or delete route. A correction is another comment,
+which keeps the discussion honest about what was said when.
+
+## Activity
+
+Two read-only views of the same append-only table. History is produced by the operations it
+describes — there is **no route that writes an event**, and the database trigger behind
+`activity_events` refuses `UPDATE` and `DELETE` outright. Both views require `VIEW_TEAM`, so
+a viewer may read them; a non-member gets `404`, not `403`.
+
+Each event is:
+
+```json
+{
+  "id": 9041,
+  "work_item_id": "…",
+  "event_type": "status_changed",
+  "from_value": "awaiting_approval",
+  "to_value": "resolved",
+  "meta": {},
+  "actor": { "id": "…", "email": "…", "display_name": "…" },
+  "created_at": "2026-10-17T09:14:02.118000Z"
+}
+```
+
+`from_value` and `to_value` hold the **stored** values and are the fact of the event — a
+status, a priority, a type, a title, or a user id for an assignment. `meta` is rendering
+convenience only (a display name, a rejection note, a comment id and a bounded preview), and
+a client must work without it. `event_type` is one of `created`, `claimed`, `assigned`,
+`unassigned`, `status_changed`, `approved`, `rejected`, `priority_changed`,
+`due_date_changed`, `type_changed`, `title_changed`, `description_changed`, `commented`.
+
+### `GET /items/{item_id}/activity`
+
+One item's timeline, newest first.
+
+### `GET /teams/{team_id}/activity`
+
+Everything that has happened in one team, newest first. It is built from the event's
+denormalised `team_id`, so the feed needs no join back to `work_items` and cannot be
+assembled by a query that forgot the team filter.
+
+### Paging, and why the cursors are not interchangeable
+
+Both views are bounded (`limit` 1–100, default 25) and paged by keyset with an opaque
+`next_cursor`. A cursor belongs to **one list**: it names a position in a specific ordered
+result set, and the item lists, comment threads and activity timelines each have their own.
+Activity rows are keyed by a bigint identity while the other lists are keyed by a UUID, so a
+cursor issued for one list is rejected by another with `422 validation_failed` rather than
+being silently reused as a meaningless position. `has_more` answers "is there another page?"
+without a second request, and `limit` is echoed so a client can tell a short page from a
+clamped one.
 
 ## Roles
 

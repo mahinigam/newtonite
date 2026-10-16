@@ -32,9 +32,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.factories import (
     activity_types,
+    api_comment,
     api_patch,
     auth_headers,
     claim_ok,
+    count_comments,
     create_item_via_api,
     etag_headers,
     login,
@@ -181,6 +183,43 @@ async def test_a_failed_history_write_rolls_back_a_transition(
     assert after == before
     assert after["status"] == "open"
     assert await activity_types(db, uuid.UUID(item_id)) == ["created", "claimed"]
+
+
+async def test_a_failed_history_write_rolls_back_a_comment(
+    client: AsyncClient, db: AsyncSession
+) -> None:
+    """A comment is not a comment until it has been recorded.
+
+    The comment insert and its `commented` event are one transaction, so a comment can
+    never exist without the timeline entry that explains it. The retry at the end also
+    shows that a *failed* attempt does not burn the idempotency key: the key row rolled
+    back with the comment it would have pointed at.
+    """
+    team, users = await scenario(db, roles={"member": Role.MEMBER}, team_key="alpha")
+    token = await login(client, users["member"].email)
+    item = await create_item_via_api(client, token=token, team_id=team.id, title="No note")
+    item_id = item["id"]
+    key = str(uuid.uuid4())
+    await break_history(db)
+
+    response = await api_comment(
+        client, token=token, item_id=item_id, body="Should not persist", key=key
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    for leak in ("activity_events", "test_fail_activity_insert", "RAISE", "asyncpg", "Traceback"):
+        assert leak not in response.text, leak
+    assert await count_comments(db, uuid.UUID(item_id)) == 0, "the comment outlived its history"
+    assert await activity_types(db, uuid.UUID(item_id)) == ["created"]
+
+    await repair_history(db)
+    retried = await api_comment(
+        client, token=token, item_id=item_id, body="Should not persist", key=key
+    )
+    assert retried.status_code == 201, retried.text
+    assert await count_comments(db, uuid.UUID(item_id)) == 1
+    assert await activity_types(db, uuid.UUID(item_id)) == ["created", "commented"]
 
 
 async def test_repairing_the_trigger_restores_normal_behaviour(

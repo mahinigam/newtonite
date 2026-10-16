@@ -13,8 +13,8 @@ app/api/            routers: parse input, call a service, choose a status code
     │  deps.py      authentication and the "authorize me against this team" dependency
     ▼
 app/services/       business rules: login, sessions, teams, memberships, work items,
-    │              activity, cursors (the place to look for "what is allowed",
-    │              independent of HTTP)
+    │              comments, activity, idempotency, pagination, cursors
+    │              (the place to look for "what is allowed", independent of HTTP)
     ▼
 app/models/         SQLAlchemy ORM: tables, relationships, enum values
     │
@@ -89,6 +89,30 @@ item id is, and an id is what a client actually holds.
 precondition, because its guard is the `UPDATE`'s own `assignee_id IS NULL` predicate rather
 than a version. A version check would be weaker — it says nothing about who owns the item.
 
+## Request flow for a comment
+
+`POST /api/v1/items/{item_id}/comments` combines the two mechanisms above and adds a third,
+which is why it is worth following separately.
+
+1. **Transport and shape.** The body is validated against `CreateCommentRequest`: stripped,
+   then length-checked between 1 and 4 000. There is no author or item field, so neither can be
+   claimed by a client.
+2. **Authentication**, then **authorization from the row**: the item is loaded and its `team_id`
+   is the team the caller is checked against. A non-member is a `404` that is byte-identical to
+   the one for an invented id.
+3. **Role.** Writing needs `COMMENT`; a viewer reading the same thread is allowed, because
+   reading is `VIEW_TEAM`.
+4. **Idempotency, in the same transaction.** The key row, the comment and the `commented` event
+   are one transaction. A concurrent duplicate blocks on `unique (actor_id, operation, key)`,
+   finds the stored outcome and replays it; the same key with a different body is a `409`
+   rather than a replay of the wrong comment. Because the key row is written inside the
+   transaction, a comment that rolls back does not burn its key.
+5. **The response is the row**, read back after commit.
+
+Nothing in this flow bumps the item's `version`: a comment changes no field of the item, so it
+is not a new version of it. Commenting on a closed item is allowed — closure ends the workflow,
+not the discussion.
+
 ## Where each rule lives
 
 | Rule | Enforced by | Why there |
@@ -106,6 +130,9 @@ than a version. A version check would be weaker — it says nothing about who ow
 | One winner per claim | SQL predicate `assignee_id IS NULL AND status = 'open'` inside the `UPDATE` | The database decides the race while it holds the row lock; no window exists |
 | One item per retried create | Unique `(actor_id, operation, key)` on `idempotency_keys`, written in the item's transaction | A concurrent duplicate blocks on the index and then replays the stored outcome |
 | History cannot diverge from state | One session, one transaction, `services/activity.py` | Proven by breaking the insert on purpose (`tests/test_activity_atomicity.py`) |
+| Who may read an item's comments or timeline | `Principal.require_item_access` in `services/comments.py` and `services/activity.py` | The team comes from the item's own row, so the same rule cannot be forgotten by one of the readers |
+| Which list a cursor belongs to | `decode_cursor(..., id_kind=...)` at each route | A cursor names a position in one ordered result set; the id kind is the discriminator that refuses a cursor from another list |
+| Comments are append-only | No route exists; the `activity_events` trigger covers history | A missing route cannot be bypassed, and the history behind a comment is protected by the database |
 
 ## Conventions
 

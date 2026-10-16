@@ -23,17 +23,13 @@ something: version `n` is a specific state, not a count of attempts.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import and_, cast, func, insert, literal_column, or_, select, update
+from sqlalchemy import cast, func, insert, literal_column, select, update
 from sqlalchemy.dialects.postgresql import REGCONFIG
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -41,26 +37,20 @@ from app.errors import (
     AlreadyClaimed,
     AssigneeRequired,
     Conflict,
-    IdempotencyKeyInProgress,
-    IdempotencyKeyReuse,
     InvalidAssignee,
     InvalidTransition,
     NotFound,
     StaleVersion,
 )
-from app.models import IdempotencyKey, Membership, User, WorkItem
-from app.models.enums import ActivityType, IdempotencyStatus, Priority, Status, WorkItemType
-from app.policy.principal import Principal
+from app.models import Membership, User, WorkItem
+from app.models.enums import ActivityType, Operation, Priority, Status, WorkItemType
+from app.policy.principal import Principal, require_item_access
 from app.policy.roles import Permission, require_permission
 from app.policy.workflow import available_transitions, rule_for
 from app.schemas.work_items import CreateWorkItemRequest, UpdateWorkItemRequest
-from app.services import activity
-from app.services.cursors import Cursor, encode_cursor
-
-CREATE_OPERATION = "create_work_item"
-
-DEFAULT_PAGE_SIZE = 25
-MAX_PAGE_SIZE = 100
+from app.services import activity, idempotency
+from app.services.cursors import Cursor
+from app.services.pagination import DEFAULT_PAGE_SIZE, descending_keyset
 
 # The text-search configuration, written as a literal rather than a bound parameter.
 # It is a fixed internal constant, never user input, and keeping it constant is what lets
@@ -124,16 +114,15 @@ async def load_visible_item(
     answer as for an id that was never issued. Returning `403` would confirm that
     another team's item exists, which a non-member has no business learning. `403` is
     reserved for a caller who *is* in the team but whose role is insufficient.
+
+    The decision itself lives in `require_item_access`, so this and the activity feed
+    cannot answer the same case differently.
     """
     row = await get_item(session, item_id)
     if row is None:
         raise NotFound("Work item not found.")
 
-    role = principal.role_in(row.team_id)
-    if role is None:
-        raise NotFound("Work item not found.")
-
-    require_permission(role, permission)
+    role = require_item_access(principal, team_id=row.team_id, permission=permission)
     return row, role
 
 
@@ -202,41 +191,14 @@ def list_statement(
         )
 
     if cursor is not None:
-        # The expanded form of `(created_at, id) < (cursor.created_at, cursor.id)`.
-        # Written out because this shape is what the composite index can walk directly:
-        # `(team_id, status, created_at DESC, id DESC)` and
-        # `(assignee_id, created_at DESC, id DESC)`.
-        statement = statement.where(
-            or_(
-                WorkItem.created_at < cursor.created_at,
-                and_(
-                    WorkItem.created_at == cursor.created_at,
-                    WorkItem.id < cursor.id,
-                ),
-            )
-        )
+        statement = statement.where(descending_keyset(WorkItem.created_at, WorkItem.id, cursor))
 
     return statement.order_by(WorkItem.created_at.desc(), WorkItem.id.desc()).limit(limit + 1)
-
-
-def next_cursor(row: Any) -> str | None:
-    return encode_cursor(row.created_at, row.id)
 
 
 # --------------------------------------------------------------------------- #
 # Creation, with idempotency
 # --------------------------------------------------------------------------- #
-
-
-def _fingerprint(request: Any) -> str:
-    """A digest of the exact request body.
-
-    Canonicalised with sorted keys so that merely reordering JSON fields is not
-    treated as a different request, and hashed so a stored fingerprint is not a copy
-    of the payload.
-    """
-    canonical = json.dumps(request.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 async def create_item(
@@ -255,22 +217,28 @@ async def create_item(
     item.
     """
     role = principal.require_permission(team_id, Permission.CREATE_ITEM)
-    fingerprint = _fingerprint(request)
+    digest = idempotency.fingerprint(request)
 
-    key_id = await _claim_key(
+    key_id = await idempotency.claim_key(
         session,
         actor_id=principal.user.id,
+        operation=Operation.CREATE_WORK_ITEM,
         key=idempotency_key,
-        fingerprint=fingerprint,
+        fingerprint=digest,
     )
 
     if key_id is None:
-        return await _replay(
+        resource_id = await idempotency.replay(
             session,
             actor_id=principal.user.id,
+            operation=Operation.CREATE_WORK_ITEM,
             key=idempotency_key,
-            fingerprint=fingerprint,
+            fingerprint=digest,
         )
+        item = await get_item(session, resource_id)
+        if item is None:  # pragma: no cover - items are never deleted
+            raise NotFound("Work item not found.")
+        return CreateOutcome(item=item, replayed=True)
 
     assignee_id = request.assignee_id
     if assignee_id is not None:
@@ -322,113 +290,17 @@ async def create_item(
             meta=await _assignee_meta(session, assignee_id),
         )
 
-    await _complete_key(
+    await idempotency.complete_key(
         session,
         key_id=key_id,
         resource_id=item_id,
         response_status=201,
+        response_body={"work_item_id": str(item_id)},
     )
     await session.commit()
 
     row = await get_item(session, item_id)
     return CreateOutcome(item=row, replayed=False)
-
-
-async def _claim_key(
-    session: AsyncSession,
-    *,
-    actor_id: uuid.UUID,
-    key: str,
-    fingerprint: str,
-) -> uuid.UUID | None:
-    """Try to become the owner of an idempotency key.
-
-    Returns the new key's id, or ``None`` when the key already belongs to somebody —
-    which, because the insert blocks on the unique index, means an earlier request with
-    this key has already **committed**.
-    """
-    try:
-        # A savepoint, so that the expected unique violation does not abort the whole
-        # transaction. Without it, PostgreSQL would refuse every later statement in
-        # this request.
-        async with session.begin_nested():
-            key_id: uuid.UUID = (
-                await session.execute(
-                    pg_insert(IdempotencyKey)
-                    .values(
-                        actor_id=actor_id,
-                        operation=CREATE_OPERATION,
-                        key=key,
-                        request_fingerprint=fingerprint,
-                        status=IdempotencyStatus.IN_PROGRESS.value,
-                    )
-                    .returning(IdempotencyKey.id)
-                )
-            ).scalar_one()
-        return key_id
-    except IntegrityError:
-        return None
-
-
-async def _replay(
-    session: AsyncSession,
-    *,
-    actor_id: uuid.UUID,
-    key: str,
-    fingerprint: str,
-) -> CreateOutcome:
-    """Answer a duplicate request from the record of the first one."""
-    existing = (
-        await session.execute(
-            select(IdempotencyKey).where(
-                IdempotencyKey.actor_id == actor_id,
-                IdempotencyKey.operation == CREATE_OPERATION,
-                IdempotencyKey.key == key,
-            )
-        )
-    ).scalar_one()
-
-    if existing.request_fingerprint != fingerprint:
-        # The same key with a different body is a client bug. Returning the first
-        # item would be silently wrong, so it is refused.
-        raise IdempotencyKeyReuse()
-
-    if existing.status != IdempotencyStatus.COMPLETED.value or existing.resource_id is None:
-        # Defensive: a committed key is always completed, because both writes happen in
-        # one transaction. Reaching this means a row was left behind by something else.
-        raise IdempotencyKeyInProgress()
-
-    item = await get_item(session, existing.resource_id)
-    if item is None:  # pragma: no cover - items are never deleted
-        raise NotFound("Work item not found.")
-
-    return CreateOutcome(item=item, replayed=True)
-
-
-async def _complete_key(
-    session: AsyncSession,
-    *,
-    key_id: uuid.UUID,
-    resource_id: uuid.UUID,
-    response_status: int,
-) -> None:
-    """Record the outcome so a later duplicate can replay it.
-
-    The stored body is minimal on purpose: a replay re-reads the resource and returns
-    its *current* representation, which is more useful than a frozen copy and can never
-    be stale. What is replayed is the identity — the same item, not a second one.
-    """
-    await session.execute(
-        update(IdempotencyKey)
-        .where(IdempotencyKey.id == key_id)
-        .values(
-            status=IdempotencyStatus.COMPLETED.value,
-            response_status=response_status,
-            resource_id=resource_id,
-            response_body={"work_item_id": str(resource_id)},
-            completed_at=func.now(),
-        )
-    )
 
 
 async def _ensure_assignable(
@@ -815,9 +687,6 @@ async def transition_item(
 
 
 __all__ = [
-    "CREATE_OPERATION",
-    "DEFAULT_PAGE_SIZE",
-    "MAX_PAGE_SIZE",
     "CreateOutcome",
     "claim_item",
     "create_item",
@@ -825,7 +694,6 @@ __all__ = [
     "list_items",
     "list_statement",
     "load_visible_item",
-    "next_cursor",
     "transition_item",
     "update_item",
 ]

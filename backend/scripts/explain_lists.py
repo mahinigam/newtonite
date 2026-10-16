@@ -6,25 +6,28 @@ trust:
 
     uv run python -m scripts.explain_lists
 
-It imports `list_statement` from the service layer, so the SQL it explains is the SQL the
-API actually executes. A hand-written approximation would be easier to write and would
-drift the first time a filter was added.
+It imports the service layer's statement builders — `list_statement`,
+`comment_list_statement`, `item_activity_statement`, `team_activity_statement` — so the
+SQL it explains is the SQL the API actually executes. A hand-written approximation would
+be easier to write and would drift the first time a filter was added.
 
 Run it against the seeded development database. On an empty database every plan is a
 sequential scan, because the tables are too small for an index to win — the numbers only
-mean something once there is a few thousand rows to walk past.
+mean something once there are a few thousand rows to walk past.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any
 
 from app.config import get_settings
 from app.db import create_database
 from app.models.enums import Priority, Status
+from app.services.activity import item_activity_statement, team_activity_statement
+from app.services.comments import comment_list_statement
 from app.services.cursors import Cursor
 from app.services.work_items import list_statement
 from sqlalchemy import text
@@ -41,6 +44,13 @@ POSTGRES_DIALECT: Callable[[], Dialect] = postgresql.dialect
 # is regenerated and identifiers change.
 TEAM_KEY = "platform"
 VIEWER_EMAIL = "sam.multi@newtonite.dev"
+
+#: How far into the team feed the deep-page measurement starts, as a fraction of the
+#: feed: half way, which is deep enough to prove the index is walked rather than scanned,
+#: and works at any seed size. (The seed's per-item timelines are only a handful of events
+#: long, so the team feed is the list where a genuine "somewhere in the middle" position
+#: exists.)
+DEEP_OFFSET_FRACTION = 2
 
 
 def compile_sql(statement: Any) -> str:
@@ -67,7 +77,7 @@ async def resolve_seed_ids(session: AsyncSession) -> tuple[uuid.UUID, uuid.UUID]
     return team_id, viewer_id
 
 
-async def deep_cursor(session: AsyncSession, team_id: uuid.UUID) -> Cursor:
+async def deep_item_cursor(session: AsyncSession, team_id: uuid.UUID) -> Cursor:
     """A cursor from 300 rows into the team's items.
 
     A hand-picked timestamp would make the "deep page" measurement meaningless — it would
@@ -84,6 +94,52 @@ async def deep_cursor(session: AsyncSession, team_id: uuid.UUID) -> Cursor:
         )
     ).one()
     return Cursor(created_at=row[0], id=row[1])
+
+
+async def deep_event_cursor(session: AsyncSession, team_id: uuid.UUID) -> Cursor:
+    """A cursor deep inside one team's activity feed.
+
+    The id is a bigint here, not a UUID — `activity_events` is keyed by an identity — so
+    the cursor carries an integer, which is what the codec's `id_kind` exists for.
+    """
+    offset = (
+        await session.execute(
+            text("SELECT count(*) / :fraction FROM activity_events WHERE team_id = :team"),
+            {"team": team_id, "fraction": DEEP_OFFSET_FRACTION},
+        )
+    ).scalar_one()
+    row = (
+        await session.execute(
+            text(
+                "SELECT created_at, id FROM activity_events WHERE team_id = :team "
+                "ORDER BY created_at DESC, id DESC OFFSET :offset LIMIT 1"
+            ),
+            {"team": team_id, "offset": offset},
+        )
+    ).one()
+    return Cursor(created_at=row[0], id=int(row[1]))
+
+
+async def busiest_item(session: AsyncSession, *, table: str) -> uuid.UUID:
+    """The item with the most rows in `table`, so the measurement uses real data.
+
+    The seed's per-item timelines and threads are short, so this picks the longest of
+    them; the team feed is measured separately because it is the list with thousands of
+    rows behind it. The two queries are spelled out rather than built from `table`,
+    because interpolating a name into SQL is a habit worth not having even here.
+    """
+    queries = {
+        "activity_events": text(
+            "SELECT work_item_id FROM activity_events GROUP BY work_item_id "
+            "ORDER BY count(*) DESC, work_item_id LIMIT 1"
+        ),
+        "comments": text(
+            "SELECT work_item_id FROM comments GROUP BY work_item_id "
+            "ORDER BY count(*) DESC, work_item_id LIMIT 1"
+        ),
+    }
+    item_id: uuid.UUID = (await session.execute(queries[table])).scalar_one()
+    return item_id
 
 
 async def explain(session: AsyncSession, label: str, sql: str) -> None:
@@ -106,41 +162,101 @@ async def main() -> None:
     try:
         async with database.session_factory() as session:
             team_id, viewer_id = await resolve_seed_ids(session)
+            event_item = await busiest_item(session, table="activity_events")
+            comment_item = await busiest_item(session, table="comments")
 
-            cases: list[tuple[str, Mapping[str, Any]]] = [
-                ("team list, first page (no filter)", {}),
-                ("team list, filtered by status", {"statuses": (Status.OPEN,)}),
+            # Built eagerly, one statement per measured shape, so the SQL under each
+            # heading is visible in this file rather than assembled from a filter dict.
+            cases: list[tuple[str, Any]] = [
+                (
+                    "team list, first page (no filter)",
+                    list_statement(team_id=team_id, viewer_id=viewer_id, limit=25),
+                ),
+                (
+                    "team list, filtered by status",
+                    list_statement(
+                        team_id=team_id,
+                        viewer_id=viewer_id,
+                        limit=25,
+                        statuses=(Status.OPEN,),
+                    ),
+                ),
                 (
                     "team list, filtered by status and priority",
-                    {
-                        "statuses": (Status.IN_PROGRESS,),
-                        "priorities": (Priority.HIGH, Priority.URGENT),
-                    },
+                    list_statement(
+                        team_id=team_id,
+                        viewer_id=viewer_id,
+                        limit=25,
+                        statuses=(Status.IN_PROGRESS,),
+                        priorities=(Priority.HIGH, Priority.URGENT),
+                    ),
                 ),
                 (
                     "queue: unassigned high-or-urgent items",
-                    {"unassigned": True, "priorities": (Priority.HIGH, Priority.URGENT)},
+                    list_statement(
+                        team_id=team_id,
+                        viewer_id=viewer_id,
+                        limit=25,
+                        unassigned=True,
+                        priorities=(Priority.HIGH, Priority.URGENT),
+                    ),
                 ),
                 (
                     "queue: unassigned high-or-urgent OPEN items (the partial index's shape)",
-                    {
-                        "unassigned": True,
-                        "statuses": (Status.OPEN,),
-                        "priorities": (Priority.HIGH, Priority.URGENT),
-                    },
+                    list_statement(
+                        team_id=team_id,
+                        viewer_id=viewer_id,
+                        limit=25,
+                        unassigned=True,
+                        statuses=(Status.OPEN,),
+                        priorities=(Priority.HIGH, Priority.URGENT),
+                    ),
                 ),
-                ("dashboard: assigned to me", {"only_mine": True}),
-                ("search: full text", {"search": "payment failed"}),
+                (
+                    "dashboard: assigned to me",
+                    list_statement(team_id=team_id, viewer_id=viewer_id, limit=25, only_mine=True),
+                ),
+                (
+                    "search: full text",
+                    list_statement(
+                        team_id=team_id,
+                        viewer_id=viewer_id,
+                        limit=25,
+                        search="payment failed",
+                    ),
+                ),
                 (
                     "team list, deep page by cursor",
-                    {"cursor": await deep_cursor(session, team_id)},
+                    list_statement(
+                        team_id=team_id,
+                        viewer_id=viewer_id,
+                        limit=25,
+                        cursor=await deep_item_cursor(session, team_id),
+                    ),
+                ),
+                (
+                    "item comments, newest first (the busiest thread in the seed)",
+                    comment_list_statement(work_item_id=comment_item, limit=25),
+                ),
+                (
+                    "item timeline, newest first (the busiest timeline in the seed)",
+                    item_activity_statement(work_item_id=event_item, limit=25),
+                ),
+                (
+                    "team activity feed, first page",
+                    team_activity_statement(team_id=team_id, limit=25),
+                ),
+                (
+                    "team activity feed, deep page by cursor",
+                    team_activity_statement(
+                        team_id=team_id,
+                        limit=25,
+                        cursor=await deep_event_cursor(session, team_id),
+                    ),
                 ),
             ]
 
-            for label, filters in cases:
-                statement = list_statement(
-                    team_id=team_id, viewer_id=viewer_id, limit=25, **filters
-                )
+            for label, statement in cases:
                 await explain(session, label, compile_sql(statement))
     finally:
         await database.dispose()

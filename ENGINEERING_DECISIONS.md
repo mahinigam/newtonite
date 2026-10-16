@@ -540,6 +540,13 @@ jump naming the reachable statuses; `closed` terminal for all four targets; stal
 missing `428`; cross-team `404`; an unknown target `422`; and two leads approving
 concurrently, where one wins and one gets `412` with a single `approved` event.
 
+**Closure ends the workflow, not the discussion** (added in Phase 5). A comment on a closed
+item is accepted, because a closed item is a record and the reason it closed is exactly the
+kind of thing somebody needs to add afterwards. Refusing it would push that note somewhere the
+item's history cannot see it. A comment changes no field of the item, so it does not bump
+`version` and cannot be mistaken for a reopening — `tests/test_comments.py` asserts both.
+Editing or deleting a comment remains excluded: a comment is evidence of what somebody said.
+
 ---
 
 ## 13. Keyset pagination, with a total order
@@ -644,6 +651,175 @@ worse than adding none: they cost write throughput and can be ignored by the pla
 **Consequences and verification.** `uv run python -m scripts.explain_lists` reproduces every
 number in `docs/DATA_MODEL.md`. `tests/test_index_inventory.py` asserts each index exists with
 the intended definition, including the one added in `0002`.
+
+---
+
+## 15. Idempotency is one shared mechanism, applied to every create
+
+**Context.** Creating a work item is retry-safe: the client sends an `Idempotency-Key`, the
+server stores the outcome and replays it. Adding comments raised the same problem — a
+double-click or a retry after a timeout must not post the same note twice — and the tempting
+move was to copy the item code path and adjust it.
+
+**Options considered.**
+
+1. Copy the item idempotency logic into the comment service.
+2. Extract the mechanism into `app/services/idempotency.py` and call it from both.
+3. Give comments a weaker guarantee (for example, deduplicate on an exact body match).
+
+**Choice.** Option 2. `fingerprint`, `claim_key`, `replay`, `complete_key` and `validate_key`
+live in one module; the unique constraint `(actor_id, operation, key)` on `idempotency_keys`
+is what actually decides a race, and both callers share it.
+
+**Why.** A copied mechanism drifts: the second copy gets a bug fix the first does not, and
+"retrying is safe" starts meaning different things on different endpoints. Option 3 is not a
+guarantee at all — two people legitimately posting the same sentence is a real thing, and a
+body hash cannot tell that from a retry. The key is scoped to `(actor, operation)`, so a key
+used for a create cannot collide with a key used for a comment by the same person, and
+`Operation` is an enum so the set of idempotent operations is visible in one place.
+
+**Trade-offs.**
+
+- Accepted: one more module and an indirection for the item path, in exchange for one place
+  where idempotency can be reviewed and one set of tests that covers both.
+- Accepted: `Idempotency-Key` is *required* on both creates. An optional key means an
+  unguarded request path exists, and the failure mode (a duplicate) is silent.
+- Accepted: the key row is written inside the operation's transaction, so a rolled-back
+  operation does not burn its key. This is what lets the atomicity test retry successfully
+  after a forced failure.
+
+**Consequences and verification.** `tests/test_comments.py` proves the comment path: a replay
+returns the same id with `Idempotent-Replay: true`, a reused key with a different body is
+`409 idempotency_key_reuse`, and two concurrent identical comments produce one row and one
+event. `tests/test_items_create.py` covers the same ground for items against the same module,
+and `tests/test_activity_atomicity.py` shows a failed comment leaves no key behind.
+
+---
+
+## 16. Comments are addressed through their item, and the team comes from the item's row
+
+**Context.** A comment belongs to a work item, and a work item belongs to a team. The API
+needed a URL and an authorization rule.
+
+**Options considered.**
+
+1. `/teams/{team_id}/items/{item_id}/comments` — the team is in the path.
+2. `/items/{item_id}/comments` — the team is derived from the item.
+3. A top-level `/comments` collection with `work_item_id` in the body.
+
+**Choice.** Option 2. The route is `/items/{item_id}/comments`, and the service loads the item
+and authorizes against **the item's own `team_id`**.
+
+**Why.** Option 1 puts a team id in the URL that the client supplies, which is exactly the
+thing the brief says never to trust as proof of access. The server would have to check that the
+path's team matches the item's team anyway — and if it forgot to, the path would be a
+confused-deputy hole. Deriving the team from the row removes the check rather than adding it:
+there is nothing to compare, because there is only one team in play. Option 3 is worse for
+reads (every list would need a join or a filter the caller supplies) and makes the item's
+thread harder to find.
+
+The rule lives once, in `Principal.require_item_access`, so the comment readers, the activity
+readers and the item detail endpoint cannot disagree about it. A non-member gets `404`, the
+same answer as for an id that was never issued.
+
+**Trade-offs.**
+
+- Accepted: the URL is nested, which is slightly less REST-conventional than a flat
+  `/comments/{id}`. Comments are never addressed by their own id in this API, so the nesting
+  costs nothing.
+- Accepted: no `team_id` appears anywhere in a comment request, so a client cannot express an
+  opinion about which team it is acting in.
+
+**Consequences and verification.** `tests/test_comments.py` and `tests/test_activity_api.py`
+each assert that a non-member's response is **byte-identical** to the response for an invented
+id, on both reads and writes.
+
+---
+
+## 17. History is readable over HTTP, and never writable
+
+**Context.** Every mutation already writes an `activity_events` row in its own transaction, and
+until this phase the only way to read the result was `psql`. The brief asks for reliable
+history; a history nobody can see is hard to call reliable.
+
+**Options considered.**
+
+1. Return the timeline inline with the item.
+2. A separate, read-only endpoint per scope, paged like every other list.
+3. An endpoint that accepts an event (so a client could "correct" history).
+
+**Choice.** Option 2, in two scopes: `/items/{item_id}/activity` and `/teams/{team_id}/activity`.
+Option 3 is refused outright — there is no route that writes an event, and the database trigger
+on `activity_events` rejects `UPDATE` and `DELETE` regardless of what any future code does.
+
+**Why.** Option 1 ties the size of an item response to the length of its history: an item with
+three hundred events would carry three hundred events into a view that shows a summary. It also
+forces one cursor to serve two very different result sets. Option 3 would make the audit trail
+editable by the very clients it is meant to hold to account.
+
+Reading history requires `VIEW_TEAM`, so a viewer may read it: the timeline names people and
+describes changes, but it is the team's own record, and hiding it from the person who is meant
+to be able to see the work would be arbitrary. The team feed is built from the event's
+denormalised `team_id`, so it needs no join back to `work_items` and cannot be assembled by a
+query that forgot the team filter.
+
+**Trade-offs.**
+
+- Accepted: two endpoints and two cursors rather than one.
+- Accepted: an extra round trip for a client that wants both the item and its history.
+- Accepted: history is never redacted or amended. If an item moves to another team — which the
+  API does not allow today — the existing events keep the team they were written with.
+
+**Consequences and verification.** `tests/test_activity_api.py` (13 tests): the timeline is
+newest first and carries the stored values; the team feed covers the whole team and no other;
+a viewer reads and a non-member gets a `404` identical to an unknown id; a long timeline pages
+without duplicates or gaps, including when every row shares a timestamp; and `POST`, `PATCH`,
+`DELETE` and `PUT` on either view are `405`.
+
+---
+
+## 18. Each list has its own cursor, and the id kind is what enforces it
+
+**Context.** There are now four paginated lists: team items, a team's activity, an item's
+comments and an item's timeline. They all page the same way — keyset on `(created_at, id)` —
+so a cursor is structurally interchangeable between them.
+
+**Options considered.**
+
+1. One cursor format, reusable anywhere, treated as a position.
+2. One format, with the list's identity encoded in the cursor and validated on decode.
+3. One format, with the *id kind* declared per route and validated on decode.
+
+**Choice.** Option 3. Most lists are keyed by a UUID; `activity_events` is keyed by a bigint
+identity. `decode_cursor(cursor, id_kind="int")` refuses a UUID-shaped id and vice versa.
+
+**Why.** Option 1 was the first implementation and it produced a real bug, found by the
+end-to-end pass rather than by a unit test: an item-list cursor handed to the activity endpoint
+decoded fine and then reached SQL as a `bigint < uuid` comparison, which is a `500`. A
+position that is *meaningful* in one list and *silently wrong* in another is worse than one
+that is refused. Option 2 is more machinery than the problem needs — a list label would have
+to be invented and kept in sync with the routes — when the id type already distinguishes the
+activity views from everything else, for a real reason (the table's key) rather than a
+decorative one. The important property is that a cursor is refused by the wrong list; the id
+kind achieves it without a new identifier to maintain.
+
+**Trade-offs.**
+
+- Accepted: the cursor is still unsigned and carries no permission decision — it is a position,
+  not a capability. Authorization is re-derived from the row on every request, so a tampered
+  cursor can only produce a different valid position within data the caller may already read.
+- Accepted: the team item list and an item's comment thread share the UUID kind, so a cursor
+  from one is *accepted* by the other and yields a valid but meaningless position. Both are
+  UUID-keyed ordered lists, and the caller can only ever see rows they are authorized to read;
+  a client that mixes them up gets a short page, not a leak. Documented rather than papered
+  over with a label.
+- Accepted: one more keyword argument at every decode site, which is where the list's key type
+  is now stated explicitly.
+
+**Consequences and verification.** `tests/test_activity_api.py` asserts that an item-list
+cursor is `422` on the activity endpoint, and `tests/test_items_list.py` still covers the
+malformed-cursor and bounds cases. The end-to-end pass exercises the cross-list case over real
+HTTP, and `docs/DATA_MODEL.md` records the plan for each of the four lists.
 
 ---
 

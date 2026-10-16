@@ -21,6 +21,7 @@ from pydantic import Field
 from app.models.enums import Priority, Status, WorkItemType
 from app.policy.workflow import available_transitions
 from app.schemas import RequestModel, ResponseModel
+from app.schemas.pagination import Page
 
 
 class UserRef(ResponseModel):
@@ -80,16 +81,8 @@ class WorkItemDetail(WorkItemSummary):
         )
 
 
-class WorkItemPage(ResponseModel):
-    """One page of a team's items.
-
-    `next_cursor` is passed back verbatim to fetch the following page.
-    """
-
-    items: list[WorkItemSummary]
-    next_cursor: str | None
-    has_more: bool
-    limit: int
+class WorkItemPage(Page[WorkItemSummary]):
+    """One page of a team's items, newest first."""
 
 
 class CreateWorkItemRequest(RequestModel):

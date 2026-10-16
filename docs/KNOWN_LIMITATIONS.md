@@ -3,7 +3,7 @@
 This document states what the project does **not** do, why, and what it would take to
 address each item. It is updated every phase and reflects the code as pushed.
 
-Last updated: 2026-10-17 (end of Phase 4).
+Last updated: 2026-10-17 (end of Phase 5).
 
 ## Not built yet, by plan
 
@@ -12,9 +12,7 @@ nothing in the repository claims they work.
 
 | Area | Status | Planned phase |
 | --- | --- | --- |
-| Comments API | Not implemented. The table exists and the seed writes real threads | 5 |
-| Activity history API (reading it over HTTP) | Not implemented. History *is* written transactionally on every mutation, and `available_transitions`/timelines can currently only be inspected through `psql` | 5 |
-| Frontend application | Not implemented | 6 |
+| Frontend application | Not implemented. Everything below is reachable over HTTP only | 6 |
 | Transactional outbox and worker | Not implemented; conditional on the core slice passing its gates | 7 |
 
 ## Deliberately excluded from scope
@@ -55,6 +53,8 @@ deferred.
 | No observability beyond structured logs | Diagnosing a production incident would rely on logs alone | Add request IDs, metrics and tracing when the deployment target is known |
 | The idle session window can be enforced up to ~60 s late | `last_used_at` is refreshed at most once a minute, so a session that has just gone idle takes effect slightly later | Deliberate: the alternative turns every read into a write. Documented in `ENGINEERING_DECISIONS.md`, with the interval as a tunable constant |
 | A revoked or expired session is reported, but a stale role is not | A session carries no role of its own, so a role change applies from the next request rather than forcing a re-login. This is intended, not a defect | Documented in `SECURITY.md`; no change planned |
+| An item's comment thread and timeline are not searchable or filterable | There is no `q` or date filter on either activity view, so finding an old note means paging to it. A thread is short and a timeline is read in context, so the cost is low | Add the same `websearch_to_tsquery` filter the item list uses, over the comment body |
+| Activity rows are not pruned | `activity_events` grows with every mutation and is never archived. At demo scale it is thousands of rows; over years it would be the largest table | Partition by month, or archive closed items' history to cold storage |
 | Seeding is additive, not converging | Editing the generator does not change rows that already exist, so a stale local dataset needs a schema rebuild | A converging seed (`ON CONFLICT DO UPDATE`) once the item generator is stable |
 
 ## Honest statement of scale

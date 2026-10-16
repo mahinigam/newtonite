@@ -68,6 +68,18 @@ class IdempotencyStatus(StrEnum):
     COMPLETED = "completed"
 
 
+class Operation(StrEnum):
+    """The logical operation a retryable request belongs to.
+
+    Idempotency keys are scoped to `(actor, operation, key)`, so two endpoints can use
+    the same key string without colliding, and a key used for one operation cannot
+    replay another operation's result.
+    """
+
+    CREATE_WORK_ITEM = "create_work_item"
+    CREATE_COMMENT = "create_comment"
+
+
 def values(enum_class: type[StrEnum]) -> tuple[str, ...]:
     """Return the stored string values of an enum, for CHECK constraints."""
     return tuple(member.value for member in enum_class)

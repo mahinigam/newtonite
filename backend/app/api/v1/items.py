@@ -29,7 +29,7 @@ from app.api.deps import (
     require_team_permission,
 )
 from app.api.preconditions import etag_for, parse_if_match
-from app.errors import IdempotencyKeyRequired, ValidationFailed
+from app.errors import ValidationFailed
 from app.models.enums import Priority, Status, WorkItemType
 from app.policy.principal import Principal
 from app.policy.roles import Permission
@@ -41,15 +41,14 @@ from app.schemas.work_items import (
     WorkItemPage,
     WorkItemSummary,
 )
-from app.services import work_items
+from app.services import idempotency, work_items
 from app.services.cursors import decode_cursor
+from app.services.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, cursor_for
 
 router = APIRouter(tags=["work-items"])
 
 CreateItem = Annotated[TeamContext, Depends(require_team_permission(Permission.CREATE_ITEM))]
 ViewTeam = Annotated[TeamContext, Depends(require_team_permission(Permission.VIEW_TEAM))]
-
-IDEMPOTENCY_KEY_MAX_LENGTH = 255
 
 
 @router.post(
@@ -75,7 +74,7 @@ async def create_item(
     `Idempotent-Replay: true`. Reusing a key with a *different* body is refused with
     `409 idempotency_key_reuse` rather than returning the first item.
     """
-    key = _validate_idempotency_key(idempotency_key)
+    key = idempotency.validate_key(idempotency_key)
 
     outcome = await work_items.create_item(
         session,
@@ -109,7 +108,7 @@ async def list_items(
     ] = None,
     q: Annotated[str | None, Query(max_length=200, description="Full-text search")] = None,
     cursor: Annotated[str | None, Query(description="`next_cursor` from the previous page")] = None,
-    limit: Annotated[int, Query(ge=1, le=work_items.MAX_PAGE_SIZE)] = work_items.DEFAULT_PAGE_SIZE,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = DEFAULT_PAGE_SIZE,
 ) -> WorkItemPage:
     """Newest first, with every filter applied in PostgreSQL.
 
@@ -134,13 +133,13 @@ async def list_items(
         only_mine=only_mine,
         viewer_id=context.principal.user.id,
         search=q,
-        cursor=decode_cursor(cursor) if cursor else None,
+        cursor=decode_cursor(cursor, id_kind="uuid") if cursor else None,
         limit=limit,
     )
 
     return WorkItemPage(
         items=[WorkItemSummary.from_row(row, role=context.role) for row in rows],
-        next_cursor=(work_items.next_cursor(rows[-1]) if has_more and rows else None),
+        next_cursor=cursor_for(rows, has_more=has_more),
         has_more=has_more,
         limit=limit,
     )
@@ -264,17 +263,6 @@ async def transition_item(
     team_role = principal.require_team(row.team_id)
     response.headers["ETag"] = etag_for(row.version)
     return WorkItemDetail.from_row(row, role=team_role)
-
-
-def _validate_idempotency_key(value: str | None) -> str:
-    if value is None or not value.strip():
-        raise IdempotencyKeyRequired()
-    key = value.strip()
-    if len(key) > IDEMPOTENCY_KEY_MAX_LENGTH:
-        raise ValidationFailed(
-            f"Idempotency-Key must be at most {IDEMPOTENCY_KEY_MAX_LENGTH} characters."
-        )
-    return key
 
 
 def _parse_assignee_filter(

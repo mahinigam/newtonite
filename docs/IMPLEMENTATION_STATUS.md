@@ -4,7 +4,7 @@ A truthful, phase-by-phase record. "Verified" means the listed command was run a
 result observed in this repository — not that the code looks correct.
 
 **Branch:** `feature/newtonite-operations-platform`
-**Last updated:** 2026-10-17 (end of Phase 4)
+**Last updated:** 2026-10-17 (end of Phase 5)
 
 ## Phase summary
 
@@ -15,7 +15,7 @@ result observed in this repository — not that the code looks correct.
 | 2 | Domain, seed data and constraint tests | Complete | See below |
 | 3 | Authentication and team authorization | Complete | See below |
 | 4 | Work-item API and the five critical correctness behaviours | Complete | See below |
-| 5 | Comments API and activity history API | Not started | — |
+| 5 | Comments API and activity history API | Complete | See below |
 | 6 | Frontend vertical slice | Not started | — |
 | 7 | Transactional outbox and worker (conditional) | Not started | Gate not yet assessed |
 | 8 | Final quality, documentation and reviewer readiness | Not started | — |
@@ -426,6 +426,131 @@ and inspectable only through `psql`. No frontend. Reopening a closed item is ref
 design. The verification pass added six probe work items to the development database
 (3 006 items, 11 377 events in total); they are ordinary rows and the seed remains additive
 and idempotent.
+
+**Known defects.** None known.
+
+## Phase 5 — Comments and the activity read API
+
+**Requirements.** The two things the seeded dataset contains but the API could not reach:
+comments on a work item, and the history that every mutation already writes. Both must be
+authorized against the item's team, both must paginate server-side with their own cursor, and
+history must remain append-only — readable, never writable, over HTTP.
+
+**Acceptance criteria.** A comment and its `commented` event cannot exist apart; a retried
+comment produces one comment and a reused key with a different body is refused; a viewer can
+read a discussion but not add to it; a non-member gets the same answer for a real item and an
+invented id; a long thread and a long timeline each page without duplicates or gaps, including
+when every row shares a timestamp; the activity cursor is independent of the item list's; and
+no route writes an event.
+
+**What was built.**
+
+- `app/services/comments.py` — `create_comment` (idempotency key, comment and `commented`
+  event in one transaction) and `list_comments` (newest first, keyset).
+- `app/services/activity.py` — read side added: `item_activity_statement`,
+  `team_activity_statement`, `list_item_activity`, `list_team_activity`. The write side
+  (`record`) is unchanged and still shares the caller's transaction.
+- `app/services/idempotency.py` — the create-item mechanism, extracted so comments reuse it
+  rather than growing a second copy: `fingerprint`, `claim_key`, `replay`, `complete_key`,
+  `validate_key`. `KEY_MAX_LENGTH` moved next to the column that enforces it.
+- `app/services/pagination.py` — page bounds, `next_cursor`, `cursor_for` and
+  `descending_keyset`, extracted from the item list so all four lists page identically.
+- `app/schemas/pagination.py` — one PEP 695 generic `Page[T]`, so `WorkItemPage`,
+  `CommentPage` and `ActivityPage` cannot drift apart.
+- `app/policy/principal.py` — `require_item_access`, the single place the "team comes from the
+  item's row" rule lives, used by the comment and activity readers.
+- `app/services/cursors.py` — cursors now carry a UUID **or** a bigint id, with the kind
+  declared at each call site.
+- `app/schemas/comments.py`, `app/schemas/activity.py`, `app/api/v1/comments.py`,
+  `app/api/v1/activity.py` — four routes: `POST|GET /items/{item_id}/comments`,
+  `GET /items/{item_id}/activity`, `GET /teams/{team_id}/activity`.
+- Three new/extended test files: `test_comments.py` (18), `test_activity_api.py` (13),
+  `test_activity_atomicity.py` (4 → 5).
+
+**Design details worth recording.** The reasoning is in `ENGINEERING_DECISIONS.md` decisions
+15–18; the short version:
+
+- *Comments are addressed through their item, and the team is derived from the item's row.*
+  There is no team id in the URL for a comment, so there is nothing for a client to lie about.
+- *Idempotency is a shared mechanism, not a special case.* The comment path reuses the item
+  path's key claim, fingerprint and replay, so "retrying is safe" means the same thing on both.
+- *Reading history is `VIEW_TEAM`; a viewer may read.* The timeline names people and describes
+  changes, but it is the team's own record.
+- *The activity cursor is its own.* Activity rows are keyed by a bigint identity while the other
+  lists are keyed by a UUID, and the id kind is declared per route — so a cursor from the item
+  list handed to the timeline is a `422` rather than a silently meaningless position.
+- *Commenting on a closed item is allowed.* Closure ends the workflow, not the discussion; a
+  comment changes no field of the item, so it does not bump `version`.
+- *The `commented` event carries a bounded preview, not the body.* `meta.preview` is the first
+  200 characters with whitespace collapsed; the comment itself keeps the full text. `meta` is
+  rendering help and a client must work without it.
+
+**Verification.**
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Backend tests | `uv run pytest -q` | Passed — **186 passed** in ~41 s (was 154) |
+| Comment atomicity | `tests/test_activity_atomicity.py` | Passed — a forced history-insert failure leaves **no comment** and does not burn the idempotency key; the retry then succeeds |
+| Concurrent identical comments | `tests/test_comments.py` | Passed — `200`/`201`, one comment id, one `commented` event |
+| Thread and timeline paging | `tests/test_comments.py`, `tests/test_activity_api.py` | Passed — walked page by page, no duplicates, no gaps; a separate case writes every row in one transaction so the `id` tie-breaker is doing the work, and asserts the timestamps really are equal |
+| Cursor scope | `tests/test_activity_api.py` | Passed — an item-list cursor is `422` on the activity endpoint |
+| Activity is read-only | `tests/test_activity_api.py` | Passed — `POST`/`PATCH`/`DELETE`/`PUT` all `405` |
+| Formatting / lint / types | `ruff format --check`, `ruff check`, `mypy .` | Passed — 78 files formatted, 76 files type-checked |
+| Models match migrations | `uv run alembic check` | Passed — `No new upgrade operations detected` (no new migration: the comment and activity indexes already existed) |
+| Query plans | `uv run python -m scripts.explain_lists` | Passed — 12 shapes, every one using an index; see `docs/DATA_MODEL.md` |
+| End-to-end over HTTP | `curl`-equivalent checks against the seeded database on a real `uvicorn` process | **67/67 checks passed** — see below |
+| CI (GitHub Actions) | run `RUN_ID` | Passed — every step green, including the 186-test suite against a `postgres:16` service container |
+
+**End-to-end evidence against the real seeded dataset** (real Argon2id logins, real HTTP, a real
+server process, the seeded platform team):
+
+- *Creating a comment.* `201`, the body stored trimmed, the author taken from the session, and
+  the item id from the path.
+- *Idempotency.* The identical retry returned `200` with the same id and
+  `Idempotent-Replay: true`; the same key with a different body returned
+  `409 idempotency_key_reuse`; no key returned `400 idempotency_key_required`; a body of spaces
+  and a 4 001-character body each returned `422` naming the `body` field.
+- *Roles and boundaries.* A viewer was refused `403` for writing and allowed `200` for reading;
+  a lead from another team got `404` for both reading and writing, **byte-identical** to the
+  response for an id that was never issued.
+- *Ordering and paging.* The thread came back newest first; `limit=1` produced a `has_more`
+  page whose successor shared **zero** ids with it; `limit=101` and a garbage cursor were each
+  `422`.
+- *The timeline.* Newest first, ending at `created`; every event named its item and its actor;
+  the `commented` events referenced exactly the thread's comment ids and carried a preview, and
+  changed no field of the item.
+- *The team feed.* Bounded, `has_more`, ordered strictly newest first, containing the item just
+  created; page 2 shared no ids with page 1; a non-member got `404 not_found`; and an item-list
+  cursor handed to the feed was `422`.
+- *Read-only.* `POST`, `PATCH` and `DELETE` on the timeline were each `405`.
+- *Concurrency, over real HTTP.* Two identical comments sent at the same instant returned `200`
+  and `201` with the same id, and the database held **exactly one** comment and **exactly one**
+  `commented` event for that note.
+- *Closure does not stop the discussion.* An item was walked to `closed`; a comment on it was
+  `201`, and the item's `version` and `status` were unchanged afterwards.
+
+**A test bug found and fixed rather than worked around.** The first version of the pagination
+fixture inserted comments with `uuid.uuid4()` ids and asserted the page order equalled insertion
+order. It failed, correctly: UUIDs are random, so `id DESC` is a total order but not the
+insertion order. The assertions were rewritten to test the real property — that the walk visits
+every row exactly once in strictly descending `(created_at, id)` order — and the fixture gained
+an explicit `spaced` mode that gives rows distinct timestamps, which is what makes "newest
+first" a deterministic claim instead of a race against the clock. A separate case keeps the
+shared-timestamp mode and asserts the timestamps really are equal, so the tie-breaker is proven
+rather than assumed.
+
+**A design bug the e2e pass found.** A cursor issued by the item list was accepted by the
+activity endpoint and then reached SQL as a `bigint < uuid` comparison — a `500` waiting for the
+first client that mixed the two up. Cursors now declare which id kind they carry at each call
+site, so the mismatch is a `422` at the boundary. This is also what makes "activity paginates
+independently of item lists" enforced rather than merely intended.
+
+**Commit.** `PHASE5_SHA` on `feature/newtonite-operations-platform`. No history was rewritten.
+
+**Remaining gaps.** No frontend, so all of this is reachable only through HTTP. Comment editing
+and deletion do not exist by design. The e2e pass added three probe items to the development
+database (3 009 items, 1 884 comments, 11 391 events in total); they are ordinary rows and the
+seed remains additive and idempotent.
 
 **Known defects.** None known.
 

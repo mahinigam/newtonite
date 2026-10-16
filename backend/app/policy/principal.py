@@ -59,4 +59,28 @@ class Principal:
         return tuple(self.roles)
 
 
-__all__ = ["Principal"]
+def require_item_access(
+    principal: Principal, *, team_id: uuid.UUID, permission: Permission
+) -> Role:
+    """The caller's role for a work item in `team_id`, or `NotFound`.
+
+    Every item-scoped read and write goes through this, so the three cases have one
+    answer each, in one place:
+
+    * the item does not exist — reported by the caller, which did the lookup;
+    * it exists but the caller is not in its team — `404`, **not** `403`, because a
+      non-member has no business learning that another team's item exists;
+    * the caller is in the team but their role is insufficient — `403`, and the message
+      names the action that was refused.
+
+    Three routes' worth of `if` blocks that could drift is exactly why this is a
+    function rather than a paragraph in each service.
+    """
+    role = principal.role_in(team_id)
+    if role is None:
+        raise NotFound("Work item not found.")
+    require_permission(role, permission)
+    return role
+
+
+__all__ = ["Principal", "require_item_access"]
