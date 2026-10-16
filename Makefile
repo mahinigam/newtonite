@@ -5,7 +5,7 @@
 
 BACKEND := backend
 
-.PHONY: help setup db-up db-down migrate dev-api test test-api lint typecheck check
+.PHONY: help setup db-up db-down migrate seed dev-api test test-api lint typecheck check
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -22,6 +22,9 @@ db-down: ## Stop the docker-compose PostgreSQL
 
 migrate: ## Apply database migrations to head
 	cd $(BACKEND) && uv run alembic upgrade head
+
+seed: ## Load deterministic demo data (idempotent; ITEMS=200 for a small set)
+	cd $(BACKEND) && uv run python -m scripts.seed --items $(or $(ITEMS),3000)
 
 dev-api: ## Run the API with autoreload on http://localhost:8000
 	cd $(BACKEND) && uv run uvicorn app.main:app --reload --port 8000

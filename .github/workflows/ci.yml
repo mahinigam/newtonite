@@ -19,7 +19,10 @@ concurrency:
 jobs:
   backend:
     name: Backend (lint, types, tests)
-    runs-on: ubuntu-latest
+    # Pinned rather than `ubuntu-latest`: the latest label is scheduled to move
+    # to Ubuntu 26 during the assessment window, and a silent base-image change
+    # in the middle of it is an avoidable variable.
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
@@ -49,13 +52,15 @@ jobs:
         working-directory: backend
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Create the disposable test database
         run: psql -h 127.0.0.1 -U newtonite -d newtonite -c "CREATE DATABASE newtonite_test OWNER newtonite;"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        # setup-uv publishes exact tags only (there is no moving `v10` tag), so
+        # this is pinned to a concrete version rather than a major alias.
+        uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
 
@@ -70,6 +75,15 @@ jobs:
 
       - name: Type check
         run: uv run mypy .
+
+      # Exercises the documented setup path end to end on a clean database:
+      # migrate, then seed. A broken migration or seed fails CI here rather than
+      # in a reviewer's terminal.
+      - name: Migrate the development database
+        run: uv run alembic upgrade head
+
+      - name: Seed a small dataset
+        run: uv run python -m scripts.seed --items 200
 
       - name: Tests
         run: uv run pytest -q

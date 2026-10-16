@@ -13,20 +13,22 @@ of concurrent and retried requests.
 > phase-by-phase state, and [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for
 > what is deliberately missing.
 
-## What works today (Phase 1 — runnable foundation)
+## What works today (Phase 2 — domain, integrity and demo data)
 
 | Capability | Status |
 | --- | --- |
 | Backend project, pinned dependencies (`uv`, Python 3.12) | Working |
-| Async SQLAlchemy + PostgreSQL wiring, connection pooling | Working |
+| Async SQLAlchemy + PostgreSQL wiring, bounded connection pool | Working |
 | Alembic migration workflow with a model/migration drift check | Working |
-| Initial schema for users, teams, memberships, work items, comments, activity events, sessions, idempotency keys | Working |
-| Database-enforced invariants (team/assignee consistency, append-only history) | Working, tested |
+| Schema for users, teams, memberships, work items, comments, activity events, sessions, idempotency keys | Working |
+| Database-enforced invariants (team/assignee consistency, append-only history, value sets) | Working, tested |
+| Deterministic, idempotent demo seed (~3 000 work items, 12 users, 4 teams) | Working |
+| Index inventory matched to query patterns, with measured plans | Working — see [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) |
 | Liveness (`/healthz`) and readiness (`/readyz`) endpoints | Working |
-| Backend test suite against real PostgreSQL | Working (12 tests) |
+| Backend test suite against real PostgreSQL | Working (33 tests) |
 | Docker Compose PostgreSQL for reviewers | Working |
-| CI: formatting, lint, type check, tests | Working |
-| Authentication, work-item API, workflow, frontend | Not yet — see status doc |
+| CI: formatting, lint, types, migrate, seed, tests | Working |
+| Authentication, work-item API, workflow, frontend | Not yet — see [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) |
 
 ## Technology stack
 
@@ -93,7 +95,53 @@ uv run alembic upgrade head
 
 Equivalently, from the repository root: `make setup` and `make migrate`.
 
-### 4. Run the API
+### 4. Load demo data
+
+```bash
+cd backend
+uv run python -m scripts.seed            # 3000 work items (default)
+uv run python -m scripts.seed --items 200  # smaller dataset
+```
+
+or `make seed` (add `ITEMS=200` for a smaller set).
+
+The seed is **idempotent**: a second run creates nothing, and importantly generates no
+duplicate activity history. Identifiers, teams, roles and the item distribution are
+derived from fixed seeds, so the dataset is the same on every machine. Timestamps are
+relative to the moment it runs, so the dashboard looks current.
+
+Seeding is additive rather than converging — editing the generator does not rewrite rows
+that already exist. To regenerate from scratch, rebuild the schema
+(see [`docs/OPERATIONS.md`](docs/OPERATIONS.md)) and run it again.
+
+### 5. Log in as a demo user
+
+All demo accounts use the same development-only password:
+
+| Email | Password | Teams and roles |
+| --- | --- | --- |
+| `ada.admin@newtonite.dev` | `Newtonite!2026` | platform: admin, support: admin |
+| `lena.lead@newtonite.dev` | `Newtonite!2026` | platform: lead |
+| `marcus.lead@newtonite.dev` | `Newtonite!2026` | support: lead |
+| `priya.lead@newtonite.dev` | `Newtonite!2026` | finance: lead |
+| `omar.lead@newtonite.dev` | `Newtonite!2026` | compliance: lead |
+| `nina.member@newtonite.dev` | `Newtonite!2026` | platform: member |
+| `noah.member@newtonite.dev` | `Newtonite!2026` | platform: member |
+| `tara.member@newtonite.dev` | `Newtonite!2026` | support: member |
+| `ivan.member@newtonite.dev` | `Newtonite!2026` | finance: member |
+| `grace.member@newtonite.dev` | `Newtonite!2026` | compliance: member |
+| `sam.multi@newtonite.dev` | `Newtonite!2026` | platform: member, finance: viewer |
+| `vic.viewer@newtonite.dev` | `Newtonite!2026` | platform: viewer |
+
+These are **development placeholders, not secrets**, and they exist so a reviewer can
+exercise every role without creating accounts. `sam.multi` deliberately holds a different
+role in each of two teams — the case a per-team role model has to get right.
+
+> The login endpoint arrives with the authentication phase, so these accounts are in the
+> database but not yet reachable over HTTP. See
+> [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md).
+
+### 6. Run the API
 
 ```bash
 cd backend
@@ -147,6 +195,7 @@ frontend/             React application (added in a later phase)
 
 | Document | Contents |
 | --- | --- |
+| [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) | Entities, integrity rules, indexes and measured query plans |
 | [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | Phase-by-phase status with verification evidence |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Configuration, migrations, diagnosis, safe resets |
 | [`ENGINEERING_DECISIONS.md`](ENGINEERING_DECISIONS.md) | Decisions with context, options, trade-offs |
