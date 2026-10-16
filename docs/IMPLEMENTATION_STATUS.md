@@ -615,7 +615,7 @@ React and TanStack Query.
 | Backend tests (unchanged, re-run) | `uv run pytest -q` | Passed — 186 passed |
 | API contract over real HTTP | `uv run python` script against the seeded database and a real `uvicorn` process | **41/41 checks passed** — see below |
 | CORS preflight | `OPTIONS /api/v1/items` with `Origin: http://localhost:5173` | Passed — `access-control-allow-origin: http://localhost:5173`, allowing `Authorization`, `Content-Type`, `Idempotency-Key`, `If-Match` |
-| CI (GitHub Actions) | run `PHASE6_RUN_ID` | Passed — both jobs green |
+| CI (GitHub Actions) | run [`38980249711`](https://github.com/mahinigam/newtonite/actions/runs/38980249711) | Passed — both jobs green, including the new frontend job (`npm ci`, lint, typecheck, test, build) |
 
 **The contract check, and why the component tests are not enough.** The frontend tests stub
 `fetch`, which is the right way to test a component but proves nothing about the wire format.
@@ -654,7 +654,7 @@ sentence. The test that named the offending field failed, and the branch was mov
 test the bug would have shipped as slightly worse wording, which is the kind of defect that is
 never reported.
 
-**Commit.** `PHASE6_SHA` on `feature/newtonite-operations-platform`. No history was rewritten.
+**Commit.** `0316859` on `feature/newtonite-operations-platform`. No history was rewritten.
 
 **Remaining gaps.** No member-management UI (the API supports it, admin only). No offline
 support. The e2e contract check added one probe item to the development database, which is an
