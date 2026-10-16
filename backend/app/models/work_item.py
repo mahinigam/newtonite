@@ -106,6 +106,17 @@ class WorkItem(Base):
             text("created_at DESC"),
             text("id DESC"),
         ),
+        # Team list with no status filter — the default view of a team's work. Added
+        # after measuring: without it the planner sequential-scanned the whole table
+        # and top-N sorted, because `ix_work_items_team_status_created` leads with
+        # `status` and cannot serve a pure "newest in this team" ordering. See
+        # `docs/DATA_MODEL.md`.
+        Index(
+            "ix_work_items_team_created",
+            "team_id",
+            text("created_at DESC"),
+            text("id DESC"),
+        ),
         # "Assigned to me" across the teams the caller belongs to.
         Index(
             "ix_work_items_assignee_created",

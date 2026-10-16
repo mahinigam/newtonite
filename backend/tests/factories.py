@@ -16,11 +16,13 @@ Deliberate shortcuts, with reasons:
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from app.models import Comment, Membership, Team, User, WorkItem
 from app.models.enums import Priority, Role, Status, WorkItemType
 from app.security.passwords import hash_password
-from httpx import AsyncClient
+from httpx import AsyncClient, Response
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 TEST_PASSWORD = "test-password-123"
@@ -104,6 +106,193 @@ async def add_comment(
 
 def auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def idempotency_headers(token: str, key: str | None = None) -> dict[str, str]:
+    return auth_headers(token) | {"Idempotency-Key": key or str(uuid.uuid4())}
+
+
+ITEMS_URL = "/api/v1/teams/{team_id}/items"
+
+
+async def api_create_item(
+    client: AsyncClient,
+    *,
+    token: str,
+    team_id: uuid.UUID,
+    key: str | None = None,
+    **fields: Any,
+) -> Response:
+    """POST a create request without asserting the outcome, so a test can."""
+    payload: dict[str, Any] = {"title": DEFAULT_TITLE, "type": "task"} | fields
+    return await client.post(
+        ITEMS_URL.format(team_id=team_id),
+        json=payload,
+        headers=idempotency_headers(token, key),
+    )
+
+
+async def create_item_via_api(
+    client: AsyncClient,
+    *,
+    token: str,
+    team_id: uuid.UUID,
+    key: str | None = None,
+    **fields: Any,
+) -> dict[str, Any]:
+    """Create an item through the API and return the body, failing loudly otherwise."""
+    response = await api_create_item(client, token=token, team_id=team_id, key=key, **fields)
+    assert response.status_code == 201, response.text
+    body: dict[str, Any] = response.json()
+    return body
+
+
+def etag_headers(token: str, etag: str) -> dict[str, str]:
+    """`Authorization` plus the precondition a conditional update requires."""
+    return auth_headers(token) | {"If-Match": etag}
+
+
+async def read_item(client: AsyncClient, *, token: str, item_id: str) -> Response:
+    return await client.get(f"/api/v1/items/{item_id}", headers=auth_headers(token))
+
+
+async def api_claim(client: AsyncClient, *, token: str, item_id: str) -> Response:
+    return await client.post(f"/api/v1/items/{item_id}/claim", headers=auth_headers(token))
+
+
+async def claim_ok(client: AsyncClient, *, token: str, item_id: str) -> dict[str, Any]:
+    response = await api_claim(client, token=token, item_id=item_id)
+    assert response.status_code == 200, response.text
+    body: dict[str, Any] = response.json()
+    return body
+
+
+async def api_transition(
+    client: AsyncClient,
+    *,
+    token: str,
+    item_id: str,
+    target: str,
+    etag: str | None = None,
+    note: str | None = None,
+) -> Response:
+    """Attempt a transition, sending `etag` if the caller supplied one.
+
+    Omitting `etag` deliberately sends no `If-Match`, which is what the
+    precondition tests want to exercise.
+    """
+    payload: dict[str, Any] = {"to": target}
+    if note is not None:
+        payload["note"] = note
+    headers = etag_headers(token, etag) if etag is not None else auth_headers(token)
+    return await client.post(f"/api/v1/items/{item_id}/transitions", json=payload, headers=headers)
+
+
+async def move_to(
+    client: AsyncClient,
+    *,
+    token: str,
+    item_id: str,
+    target: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Walk one workflow step the way a real client does.
+
+    Reads the item for its current `ETag`, then sends that as `If-Match`. A test that
+    wants a *stale* precondition must call `api_transition` with an explicit `etag`
+    instead.
+    """
+    current = await read_item(client, token=token, item_id=item_id)
+    assert current.status_code == 200, current.text
+    response = await api_transition(
+        client,
+        token=token,
+        item_id=item_id,
+        target=target,
+        etag=current.headers["etag"],
+        note=note,
+    )
+    assert response.status_code == 200, response.text
+    body: dict[str, Any] = response.json()
+    return body
+
+
+async def api_patch(
+    client: AsyncClient,
+    *,
+    token: str,
+    item_id: str,
+    etag: str | None = None,
+    **fields: Any,
+) -> Response:
+    headers = etag_headers(token, etag) if etag is not None else auth_headers(token)
+    return await client.patch(f"/api/v1/items/{item_id}", json=fields, headers=headers)
+
+
+async def activity_events(session: AsyncSession, item_id: uuid.UUID) -> list[dict[str, Any]]:
+    """The item's history, oldest first, with the values each event carries."""
+    rows = (
+        (
+            await session.execute(
+                text(
+                    "SELECT event_type, from_value, to_value, meta, actor_id "
+                    "FROM activity_events "
+                    "WHERE work_item_id = :id ORDER BY id"
+                ),
+                {"id": item_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return [dict(row) for row in rows]
+
+
+async def raw_item(session: AsyncSession, item_id: uuid.UUID) -> dict[str, Any]:
+    """Read the stored row directly, for asserting on what the database holds.
+
+    Deliberately bypasses the API: several tests need to prove that a *rejected*
+    request left the persisted state untouched, which an API read could not
+    distinguish from an API read of the right value.
+    """
+    row = (
+        (
+            await session.execute(
+                text(
+                    "SELECT title, description, type, priority, status, assignee_id, version "
+                    "FROM work_items WHERE id = :id"
+                ),
+                {"id": item_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return dict(row)
+
+
+async def activity_types(session: AsyncSession, item_id: uuid.UUID) -> list[str]:
+    """The item's history, oldest first, as a list of event types."""
+    rows = (
+        (
+            await session.execute(
+                text("SELECT event_type FROM activity_events WHERE work_item_id = :id ORDER BY id"),
+                {"id": item_id},
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [str(row) for row in rows]
+
+
+async def count_items(session: AsyncSession, team_id: uuid.UUID | None = None) -> int:
+    statement = "SELECT count(*) FROM work_items"
+    parameters: dict[str, Any] = {}
+    if team_id is not None:
+        statement += " WHERE team_id = :team_id"
+        parameters["team_id"] = team_id
+    return int((await session.execute(text(statement), parameters)).scalar_one())
 
 
 async def login(client: AsyncClient, email: str, password: str = TEST_PASSWORD) -> str:

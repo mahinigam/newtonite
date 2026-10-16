@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from alembic import command
+from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,7 +28,15 @@ async def test_every_expected_table_exists(db: AsyncSession) -> None:
     assert tables - set(ALL_TABLES) == {ALEMBIC_TABLE}
 
 
-async def test_alembic_version_is_recorded(db: AsyncSession) -> None:
+async def test_alembic_version_is_recorded(db: AsyncSession, test_database_url: str) -> None:
+    """The recorded revision is the migration head.
+
+    The expected value is read from the migration scripts rather than pinned here, so
+    adding a revision does not mean editing this assertion. The question the test asks is
+    "is the database at head?", which stays the right question as the schema evolves.
+    """
+    head = ScriptDirectory.from_config(alembic_config(test_database_url)).get_current_head()
     version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
 
-    assert version == "0001"
+    assert head is not None, "no migration script claims to be the head"
+    assert version == head

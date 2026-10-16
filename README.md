@@ -13,7 +13,7 @@ of concurrent and retried requests.
 > phase-by-phase state, and [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for
 > what is deliberately missing.
 
-## What works today (Phase 3 — authentication and team authorization)
+## What works today (Phase 4 — work-item API and the correctness behaviours)
 
 | Capability | Status |
 | --- | --- |
@@ -23,16 +23,23 @@ of concurrent and retried requests.
 | Schema for users, teams, memberships, work items, comments, activity events, sessions, idempotency keys | Working |
 | Database-enforced invariants (team/assignee consistency, append-only history, value sets) | Working, tested |
 | Deterministic, idempotent demo seed (~3 000 work items, 12 users, 4 teams) | Working |
-| Index inventory matched to query patterns, with measured plans | Working — see [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) |
+| Indexes matched to query patterns, with measured plans | Working — see [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) |
 | Login, logout and session validation (Argon2id, hashed tokens, absolute + idle expiry, revocation) | Working |
 | Per-team authorization with an explicit role matrix, enforced on the server | Working |
 | Teams, membership and roster endpoints; admin-only role management | Working |
-| One error envelope: `401` / `403` / `404` / `409` / `412` / `422` with stable codes | Working |
+| One error envelope: `400` / `401` / `403` / `404` / `409` / `412` / `422` / `428` with stable codes | Working |
+| Work-item create, read, edit and list, all authorized against team membership | Working |
+| Server-side filtering (`status`, `priority`, `type`, `assignee=me\|none`), full-text search, keyset pagination | Working |
+| Atomic claim — two concurrent claims produce at most one owner | Working, tested concurrently |
+| Stale-update rejection: `If-Match` required (`428`), stale writes refused (`412`) | Working, tested |
+| Idempotent creation via a required `Idempotency-Key`, safe under retry and concurrency | Working, tested concurrently |
+| Server-enforced workflow with per-transition role permissions; `status` not patchable | Working |
+| Activity history written in the same transaction as every mutation | Working — reads arrive in Phase 5 |
 | Liveness (`/healthz`) and readiness (`/readyz`) endpoints | Working |
-| Backend test suite against real PostgreSQL | Working (68 tests) |
+| Backend test suite against real PostgreSQL | Working (154 tests) |
 | Docker Compose PostgreSQL for reviewers | Working |
 | CI: formatting, lint, types, migrate, seed, tests | Working |
-| Work-item API, workflow transitions, frontend | Not yet — see [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) |
+| Comments API, activity read API, frontend | Not yet — see [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) |
 
 ## Technology stack
 
@@ -157,7 +164,40 @@ curl -s http://localhost:8000/api/v1/teams      -H "Authorization: Bearer $TOKEN
 offer. It is advisory to the interface only — every write is authorized again on the server.
 The full endpoint list is in [`docs/API.md`](docs/API.md).
 
-### 6. Run the API
+### 6. Create, claim and move a work item
+
+The three headers that carry the correctness guarantees, in one sequence. Everything below
+runs against a seeded database; replace `<TEAM_ID>` with a team from `/auth/me`.
+
+```bash
+# Create — Idempotency-Key is required, so a retry cannot make a second item.
+ITEM=$(curl -s -X POST "http://localhost:8000/api/v1/teams/<TEAM_ID>/items" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"title":"Refund the duplicate charge","type":"payment","priority":"urgent"}')
+echo "$ITEM"                       # 201, with an ETag
+ID=$(echo "$ITEM" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# Claim — atomic. No If-Match: the race is decided by assignee_id IS NULL inside the UPDATE.
+curl -s -X POST "http://localhost:8000/api/v1/items/$ID/claim" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Edit — If-Match is required. Send the ETag you last saw, or get 428 / 412.
+curl -s -X PATCH "http://localhost:8000/api/v1/items/$ID" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H 'If-Match: "2"' -d '{"priority":"high"}'
+
+# Move it. There is no endpoint that writes status directly.
+curl -s -X POST "http://localhost:8000/api/v1/items/$ID/transitions" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H 'If-Match: "3"' -d '{"to":"in_progress"}'
+
+# List, filtered and paged on the server.
+curl -s "http://localhost:8000/api/v1/teams/<TEAM_ID>/items?assignee=none&priority=urgent&limit=5" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### 7. Run the API
 
 ```bash
 cd backend
@@ -197,7 +237,7 @@ backend/
   app/
     api/              FastAPI routers (thin HTTP layer) and dependencies
     models/           SQLAlchemy ORM models and domain enums
-    policy/           the role matrix and the authenticated principal
+    policy/           the role matrix, the authenticated principal and the workflow
     schemas/          request and response models, separate from the ORM
     security/         password hashing and session tokens
     services/         business rules, testable without a request
@@ -205,7 +245,7 @@ backend/
     db.py             async engine and session management
     errors.py         error types and the HTTP error envelope
     main.py           application factory
-  scripts/            the deterministic demo seed
+  scripts/            the demo seed, maintenance commands and the query-plan tool
   tests/              integration tests against PostgreSQL
 docker/
   initdb/             creates the test database on first Compose start

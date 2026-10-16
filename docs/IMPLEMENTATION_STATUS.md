@@ -4,7 +4,7 @@ A truthful, phase-by-phase record. "Verified" means the listed command was run a
 result observed in this repository — not that the code looks correct.
 
 **Branch:** `feature/newtonite-operations-platform`
-**Last updated:** 2026-10-17
+**Last updated:** 2026-10-17 (end of Phase 4)
 
 ## Phase summary
 
@@ -14,8 +14,8 @@ result observed in this repository — not that the code looks correct.
 | 1 | Runnable foundation | Complete | See below |
 | 2 | Domain, seed data and constraint tests | Complete | See below |
 | 3 | Authentication and team authorization | Complete | See below |
-| 4 | Core API and critical correctness behaviours | Not started | — |
-| 5 | Workflow, collaboration and activity API | Not started | — |
+| 4 | Work-item API and the five critical correctness behaviours | Complete | See below |
+| 5 | Comments API and activity history API | Not started | — |
 | 6 | Frontend vertical slice | Not started | — |
 | 7 | Transactional outbox and worker (conditional) | Not started | Gate not yet assessed |
 | 8 | Final quality, documentation and reviewer readiness | Not started | — |
@@ -285,6 +285,144 @@ Argon2id hashes, the documented password):
 **Remaining gaps.** No work-item endpoints yet, so the seeded items are still only reachable
 through `psql`. No frontend. No login rate limiting (documented in
 [`SECURITY.md`](SECURITY.md) with the residual risk).
+
+**Known defects.** None known.
+
+## Phase 4 — Work-item API and the five critical correctness behaviours
+
+**Requirements.** Work-item create, read, update and list endpoints; server-side filtering,
+search and cursor pagination; and the behaviours the brief singles out — an atomic claim, a
+stale update being rejected rather than silently applied, idempotent creation, server-enforced
+workflow transitions with role authorization, and an activity history that cannot disagree
+with the state it describes. Plus indexing driven by real query patterns, and evidence
+rather than assertion for all of it.
+
+**Acceptance criteria.** Two concurrent claims produce at most one claimant; a stale update
+is rejected and changes nothing; a replayed create produces at most one item and a mismatched
+payload is refused; cross-team access and forbidden role actions are denied; illegal workflow
+transitions are refused; a failed history insert rolls the state change back; and every list
+view is filtered and paged in PostgreSQL with a bounded page size.
+
+**What was built.**
+
+- `app/services/work_items.py` — the whole item lifecycle. `list_statement` (pure, so the
+  exact SQL can be measured), `create_item` (idempotency in one transaction),
+  `claim_item` (one conditional `UPDATE`), `update_item`, `transition_item`, and
+  `load_visible_item` (authorizes from the row's team).
+- `app/policy/workflow.py` — the transition table: origin, destination, required permission,
+  `requires_assignee`, and `available_transitions(status, role, has_assignee)`.
+- `app/services/activity.py` — transactional history writes, sharing the caller's session.
+- `app/services/cursors.py` — `(created_at, id)` cursors, base64url, opaque.
+- `app/api/preconditions.py` — `ETag` construction and `If-Match` parsing (`7`, `"7"`,
+  `W/"7"`; absent → `428`).
+- `app/schemas/work_items.py` — summary and detail shapes, tri-state edit payload.
+- `app/api/v1/items.py` — six routes.
+- `alembic/versions/0002_team_created_index.py` — one index, added because of a measurement.
+- `scripts/explain_lists.py` — the measuring instrument behind `docs/DATA_MODEL.md`.
+- Seven new test files: `test_items_create.py` (17), `test_transitions.py` (16),
+  `test_items_update.py` (15), `test_items_list.py` (15), `test_claim.py` (9),
+  `test_items_concurrency.py` (4), `test_activity_atomicity.py` (4).
+
+**Design details worth recording.** The reasoning is in `ENGINEERING_DECISIONS.md` decisions
+9–14; the short version:
+
+- *Claiming is one `UPDATE` whose affected-row count is the answer.* The eligibility condition
+  is inside the statement, so there is no read-then-write window to race. A version
+  precondition was considered and rejected as the *weaker* guard — it says nothing about the
+  assignee.
+- *The `Idempotency-Key` is required, and the key row shares the item's transaction.*
+  Concurrent duplicates block on the unique index and then replay, so the loser cannot slip
+  a second item in.
+- *`If-Match` is required on every edit and transition (`428` when absent), and the comparison
+  shares the `UPDATE` that bumps the version.* A stale attempt gets `412` with
+  `details.current`.
+- *Status is not a patchable field.* `PATCH` refuses it, so closure and approval cannot be
+  reached by a generic edit.
+- *History is written in the same transaction.* Verified by breaking it on purpose.
+
+**Verification.**
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Backend tests | `uv run pytest -q` | Passed — **154 passed** in ~33 s (was 73) |
+| Two concurrent claims | `tests/test_items_concurrency.py` | Passed — `200`/`409`, one assignee, one `claimed` event. Repeated 10× for flakiness, then checked against a deliberately broken implementation |
+| Concurrent creates with one key | same file | Passed — `201`/`200`, same id, exactly one row |
+| Stale update rejected | `tests/test_items_update.py` | Passed — `412`, `details.current`, newer value intact, no history written |
+| Illegal transition refused | `tests/test_transitions.py` | Passed — all edges, plus role denials, terminal `closed`, and two concurrent approvals |
+| Failed history insert rolls back | `tests/test_activity_atomicity.py` | Passed — item byte-identical after a forced trigger failure, for edit, claim and transition |
+| Formatting / lint / types | `ruff format --check`, `ruff check`, `mypy .` | Passed — 66 files formatted, 66 type-checked |
+| Models match migrations | `uv run alembic check` | Passed — `No new upgrade operations detected` |
+| Query plans | `uv run python -m scripts.explain_lists` | All seven shapes use an index; see `docs/DATA_MODEL.md` |
+| End-to-end over HTTP | `curl` against the seeded database on a real `uvicorn` process | **49/49 checks passed** — see below |
+
+**End-to-end evidence against the real seeded dataset** (3 000 items, 12 accounts, real
+Argon2id logins, real HTTP, a real server process):
+
+- *Idempotency.* A create with a fresh key returned `201`; the identical retry returned `200`
+  with the same id and `Idempotent-Replay: true`; the same key with a different body returned
+  `409 idempotency_key_reuse`; no key at all returned `400 idempotency_key_required`.
+- *Claiming.* A viewer was refused with `403`; a member claimed the item, which set the
+  assignee, bumped the version to 2, left the status at `open`, and wrote one `claimed` event.
+- *Concurrency, over real HTTP.* Two members POSTed a claim at the same instant: one `200`,
+  one `409`, and **exactly one** `claimed` event in the database. The same create sent twice
+  concurrently returned `200` and `201` with the same id, and exactly **one** row existed with
+  that title.
+- *Stale writes.* An edit with no `If-Match` → `428 precondition_required`; an edit from
+  version 1 after the item had moved to version 2 → `412 stale_version` with
+  `details.current.version = 2`; the same edit from the current version → `200`, version 3.
+- *The workflow.* member claims → starts → submits; the member's attempt to approve was `403`
+  and their `available_transitions` was empty, while the lead's held exactly the two approval
+  moves; the lead approved, then closed, after which `available_transitions` was empty; an
+  attempt to reopen a closed item was `409 invalid_transition`.
+- *History.* The item's timeline read back from the database as eight correctly attributed
+  events — `created`, `claimed`, `title_changed`, `priority_changed`, `status_changed`,
+  `status_changed`, `approved`, `status_changed` — with the two approvals attributed to the
+  lead and the rest to the member.
+- *Listing.* A page was bounded by `limit` and reported `has_more`; page 2 shared **zero** ids
+  with page 1; `limit=101` was `422`; full-text search found the item just created; combined
+  filters returned only matching rows.
+- *The team boundary.* `sam.multi` (viewer in finance) could read a finance item, while the
+  platform lead got `404` for the same item on both read and edit, and `sam.multi` was refused
+  `403` for claiming in finance where they are only a viewer.
+- *Assignee eligibility.* A lead assigning an item to a member of another team got
+  `422 invalid_assignee` on both create and edit; a member assigning to a colleague got
+  `403 forbidden` naming `assign_others`; after all three refusals the item was unchanged
+  (assignee `null`, version 1).
+
+**A correction recorded rather than quietly fixed.** The first draft of the concurrency test
+file called `raw_item` without `await` inside a subscript, which raised
+`TypeError: 'coroutine' object is not subscriptable` in four tests. The fix was in the test,
+not the assertion. Separately, one test asserted the *order* of field-change events from an
+assumed order; the implementation emits them in the field-declaration order, which is
+deterministic. The test was corrected to the real, documented order — and the ordering
+guarantee is now stated in the code comment on `_FIELD_EVENTS`, so it is a documented
+property rather than an accident of `dict` iteration.
+
+**How the concurrency and atomicity tests were validated.** A test that passes proves
+nothing if it would also pass against the bug it targets. Each of the three load-bearing
+tests was therefore checked by deliberately breaking the implementation:
+
+| Test | Deliberate break | Result |
+| --- | --- | --- |
+| Concurrent claims | `claim_item` rewritten as read-then-write with a widened window | Both claim tests **failed**; all ten racers "won" |
+| Concurrent create | duplicate keys made to proceed instead of replaying | The idempotency test **failed** |
+| Activity atomicity | the state change committed before the history insert | The rollback test **failed** with its own message ("the claim survived without its history entry") |
+
+`app/services/work_items.py` was restored after each and verified byte-identical with `diff`.
+
+**A measurement that found real work.** The unfiltered team list was a sequential scan plus a
+top-N sort (3.19 ms) because the existing composite index leads with `status`. Revision `0002`
+adds `ix_work_items_team_created`; the plan became an index scan at 0.53 ms. Separately, the
+text-search configuration was being passed as a bound parameter, which under a generic plan
+made PostgreSQL re-evaluate `websearch_to_tsquery` for every index entry — 5.47 ms against
+0.245 ms with the same plan shape. Both are documented with their numbers in
+`docs/DATA_MODEL.md`.
+
+**Remaining gaps.** Comments and the activity read API do not exist yet, so history is written
+and inspectable only through `psql`. No frontend. Reopening a closed item is refused by
+design. The verification pass added six probe work items to the development database
+(3 006 items, 11 377 events in total); they are ordinary rows and the seed remains additive
+and idempotent.
 
 **Known defects.** None known.
 

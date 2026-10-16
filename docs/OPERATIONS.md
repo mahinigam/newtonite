@@ -133,6 +133,37 @@ leaving recent rows in place so a support question about a session can still be 
 from the table. It is the only code path that deletes from `auth_sessions`; nothing
 expires a session by deleting it.
 
+### Idempotency keys
+
+`idempotency_keys` rows are not history and are not read after the retry window a client
+would reasonably use. There is **no automatic pruning**; the table grows with creation
+traffic. It is safe to delete old keys — a deleted key means only that a retry long after
+the fact would create a second item, which is exactly why the window should exceed the
+longest a client would retry:
+
+```sql
+-- Keep a week of retry protection; adjust to the client's retry budget.
+DELETE FROM idempotency_keys WHERE created_at < now() - interval '7 days';
+```
+
+Nothing on the read path consults this table, so pruning cannot break an existing item.
+
+## Measuring query plans
+
+The performance claims in [`DATA_MODEL.md`](DATA_MODEL.md) are reproducible rather than
+asserted:
+
+```bash
+cd backend
+uv run python -m scripts.explain_lists
+```
+
+It prints `EXPLAIN (ANALYZE, BUFFERS)` for the seven list shapes the API actually issues,
+against whatever is in the connected database. It imports the service layer's
+`list_statement`, so the SQL it explains is the SQL the API runs. Run it against the seeded
+database — on an empty table every plan is a sequential scan, because an index cannot win
+when there is nothing to walk past.
+
 ## Deployment caveats
 
 - The API is designed to run behind a TLS-terminating proxy. Session tokens are bearer

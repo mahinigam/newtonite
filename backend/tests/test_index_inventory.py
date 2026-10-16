@@ -18,6 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 EXPECTED_INDEXES: dict[str, str] = {
     # Team-scoped, status-filtered lists, newest first, with `id` as tie-breaker.
     "ix_work_items_team_status_created": "created_at DESC, id DESC",
+    # The same list without a status filter (the default team view). Added by migration
+    # 0002 after measuring that the index above cannot serve it.
+    "ix_work_items_team_created": "created_at DESC, id DESC",
     # "assigned to me" across teams.
     "ix_work_items_assignee_created": "created_at DESC, id DESC",
     # Partial index: only rows the unassigned-urgent queue can return.

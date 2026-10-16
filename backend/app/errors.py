@@ -165,6 +165,50 @@ class IdempotencyKeyReuse(Conflict):
     )
 
 
+class IdempotencyKeyInProgress(Conflict):
+    message = "An identical request is still being processed. Retry shortly."
+    code = "idempotency_key_in_progress"
+
+
+class AssigneeRequired(Conflict):
+    """Work cannot start without an owner."""
+
+    code = "assignee_required"
+    message = "Assign the item to somebody before starting it."
+
+
+class InvalidAssignee(AppError):
+    """The chosen assignee is not eligible for this item's team."""
+
+    status_code = 422
+    code = "invalid_assignee"
+    message = "That person is not a member of this team."
+
+
+class IdempotencyKeyRequired(AppError):
+    status_code = 400
+    code = "idempotency_key_required"
+    message = (
+        "Creating a work item requires an 'Idempotency-Key' header, so that a retry "
+        "cannot create a duplicate."
+    )
+
+
+class PreconditionRequired(AppError):
+    """A conditional update arrived without its precondition.
+
+    `428 Precondition Required` (RFC 6585) rather than a silent last-write-wins: the
+    API will not overwrite a value the caller has not demonstrated they have seen.
+    """
+
+    status_code = 428
+    code = "precondition_required"
+    message = (
+        "Send an 'If-Match' header with the item's current version, so that a change "
+        "based on a stale copy is rejected instead of silently overwriting newer data."
+    )
+
+
 class LastAdmin(Conflict):
     code = "last_admin"
     message = "A team must keep at least one admin."

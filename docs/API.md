@@ -3,9 +3,9 @@
 Base path: `/api/v1`. The generated OpenAPI schema is served at `/api/v1/openapi.json` and a
 browsable UI at `/docs`.
 
-**This document lists what is implemented.** Work-item endpoints, the workflow transitions
-and comments do not exist yet; they are tracked in
-[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
+**This document lists what is implemented.** Work items, their filters, pagination, claiming
+and the approval workflow are implemented. Comments and the activity *read* API are not yet;
+they are tracked in [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
 
 ## Authentication
 
@@ -127,7 +127,230 @@ Refusals:
 | Last admin of the team | `409 last_admin` |
 | Still the assignee of work items in this team | `409 member_has_assigned_items` — reassign first. Removing a member never silently unassigns their work, and never touches the history they created |
 
-## Users
+## Work items
+
+Work items belong to a team. Creating and listing are team-scoped
+(`/teams/{team_id}/items`), so the team boundary is part of the URL; reading and changing a
+single item address it directly (`/items/{item_id}`) and the item's **own** team is then
+authorized against the caller's membership. A client-supplied team or role is never
+consulted.
+
+Three headers carry the correctness guarantees:
+
+| Header | On | Purpose |
+| --- | --- | --- |
+| `Idempotency-Key` | create | **Required.** Makes a retry safe |
+| `If-Match` | update, transitions | **Required.** The version the caller believes it is editing |
+| `ETag` | every item response | The version to send back as `If-Match` |
+
+### Item shape
+
+A list returns a **summary**; a single-item read adds `description` and `created_by`. The
+list does not carry a 20 000-character description per row.
+
+```json
+{
+  "id": "…",
+  "team_id": "…",
+  "title": "Refund the duplicate charge",
+  "type": "payment",
+  "status": "in_progress",
+  "priority": "urgent",
+  "assignee": { "id": "…", "email": "…", "display_name": "…" },
+  "due_at": null,
+  "version": 3,
+  "created_at": "…",
+  "updated_at": "…",
+  "available_transitions": ["awaiting_approval"]
+}
+```
+
+`available_transitions` is **computed on the server** for this caller's role, so the buttons
+an interface offers and the transitions the server would accept are the same list. It is
+still advisory — every transition is validated again when attempted.
+
+### `POST /teams/{team_id}/items` — requires `Idempotency-Key`
+
+```json
+{
+  "title": "Refund the duplicate charge",
+  "description": "Customer was charged twice.",
+  "type": "payment",
+  "priority": "urgent",
+  "assignee_id": null,
+  "due_at": null
+}
+```
+
+`title`, `type` are required; `priority` defaults to `medium`. There is no `team_id`,
+`status`, `version` or `created_by` field — the team comes from the path, the status always
+starts at `open`, and the rest is the server's. Sending them is a `422`, not a silently
+ignored field.
+
+| Situation | Response |
+| --- | --- |
+| First delivery of the key | `201 Created`, `ETag` |
+| The **same** key and the same body again | `200 OK`, same item, `Idempotent-Replay: true` |
+| The same key with a **different** body | `409 idempotency_key_reuse` |
+| No `Idempotency-Key` header, or an empty one | `400 idempotency_key_required` |
+| Key longer than 255 characters | `422 validation_failed` |
+| Assigning to somebody else, without the permission | `403 forbidden` |
+| Assigning to somebody not in this team | `422 invalid_assignee` |
+
+The key is scoped to `(caller, operation, key)`, so two people using the same key do not
+collide, and a reused key returns **that caller's** original item. See
+[`../ENGINEERING_DECISIONS.md`](../ENGINEERING_DECISIONS.md) decision 10.
+
+### `GET /teams/{team_id}/items` — filtering, search and paging
+
+| Parameter | Meaning |
+| --- | --- |
+| `status` | `open`, `in_progress`, `awaiting_approval`, `resolved`, `closed`. **Repeatable** |
+| `priority` | `low`, `medium`, `high`, `urgent`. Repeatable |
+| `type` | `task`, `bug`, `incident`, `payment`, `request`. Repeatable |
+| `assignee` | `me`, `none`, or a user id |
+| `q` | Full-text search over title and description (max 200 characters) |
+| `limit` | 1–100, default 25 |
+| `cursor` | `next_cursor` from the previous page |
+
+Filters combine with `AND`; repeated values within one filter combine with `OR`
+(`?priority=high&priority=urgent`). Every filter is applied in PostgreSQL — the browser is
+never sent a dataset to filter itself.
+
+```json
+{ "items": [ … ], "next_cursor": "eyJjcmVhdGVkX2F0Ijoi…", "has_more": true, "limit": 25 }
+```
+
+Ordering is `created_at DESC`, with `id DESC` as a tie-breaker, so the order is **total** —
+two items created in the same millisecond still have exactly one correct position. That is
+what makes paging stable.
+
+**Paging is keyset, not `OFFSET`.** Pass `next_cursor` back to continue. An item created
+while somebody is reading page 1 therefore cannot shift a later page: page 2 resumes from
+the position page 1 stopped at, rather than from a row count. The cursor is opaque, unsigned
+and carries no permission decision — authorization is re-derived from the row on every
+request, so a tampered cursor cannot reach another team's data. A malformed cursor is
+`422`, not a silent restart from the beginning.
+
+| Situation | Response |
+| --- | --- |
+| `limit` outside 1–100 | `422 validation_failed` |
+| Malformed `cursor` | `422 validation_failed` |
+| `assignee` neither `me`, `none` nor a UUID | `422 validation_failed` |
+| Not a member of the team | `404 not_found` |
+
+### `GET /items/{item_id}`
+
+Returns the detail shape and an `ETag` header, for example `ETag: "3"`. An item in a team
+the caller does not belong to is `404`, byte-identical to an id that was never issued.
+
+### `PATCH /items/{item_id}` — requires `If-Match`
+
+```json
+{ "title": "…", "priority": "urgent" }
+```
+
+Partial: only the fields actually present are applied, so an omitted field means *no
+opinion*. Sending a field as `null` **clears** it, which is how an item is unassigned or a
+due date removed. `status` is not editable here — status changes go through `transitions`
+below, so a generic edit cannot bypass approval or closure.
+
+| Situation | Response |
+| --- | --- |
+| No `If-Match` header | `428 precondition_required` |
+| `If-Match` does not match the current version | `412 stale_version`, body carries `details.current` |
+| `If-Match` not a version number | `422 validation_failed` |
+| Cannot change this field with this role | `403 forbidden` |
+| Item is in another team | `404 not_found` |
+| `status`, `version`, `team_id` or `created_by` in the body | `422 validation_failed` |
+
+A request that changes nothing succeeds, and does **not** bump the version or write history —
+a form that submits unchanged values is not an event.
+
+**On assignment.** Moving work to or from *somebody else* (or clearing another person's
+assignment) requires the `assign others` permission — that is a lead action. Taking an
+unassigned item, or releasing your own, is a `claim`/`unclaim` and a member may do it. So a
+member reassigning a colleague's item gets `403`, while the same member claiming an
+unassigned one gets `200`.
+
+### `POST /items/{item_id}/claim`
+
+Takes ownership of an unassigned, open item. **No `If-Match`** is expected, and none is
+needed: the condition that decides a race is `assignee_id IS NULL AND status = 'open'`,
+evaluated inside the `UPDATE` itself. A version check would be the *weaker* guard here — it
+can pass while somebody else is claiming the same item.
+
+| Situation | Response |
+| --- | --- |
+| Free and open | `200`, item assigned to the caller, version bumped, one `claimed` event |
+| Already owned by the caller | `200`, unchanged — a double-click is a no-op, not a second event |
+| Owned by somebody else | `409 item_already_claimed` |
+| Not open (for example already started) | `409 invalid_transition` |
+| Viewer, or not in the team | `403 forbidden` / `404 not_found` |
+
+Claiming sets the **assignee only**. It does not start the work; that is a separate,
+explicitly recorded transition.
+
+### `POST /items/{item_id}/transitions` — requires `If-Match`
+
+```json
+{ "to": "awaiting_approval", "note": "Ready for review." }
+```
+
+`note` (max 2000 characters) is optional and is recorded in the history — it is how a
+rejection carries its reason.
+
+**There is no endpoint that writes `status` directly.** Legality, permission and the version
+precondition are all checked before anything changes.
+
+| From | To | Permission | Recorded as |
+| --- | --- | --- | --- |
+| `open` | `in_progress` | `transition work` | `status_changed` — **requires an assignee** |
+| `in_progress` | `awaiting_approval` | `transition work` | `status_changed` |
+| `awaiting_approval` | `resolved` | `approve` (lead) | `approved` |
+| `awaiting_approval` | `in_progress` | `approve` (lead) | `rejected`, with the note |
+| `resolved` | `closed` | `close` (lead) | `status_changed` |
+| `closed` | *any* | — | Refused: closing is terminal |
+
+| Situation | Response |
+| --- | --- |
+| Not an edge in the table above | `409 invalid_transition`, body carries `details.available_transitions` |
+| `open → in_progress` with no assignee | `409 assignee_required` |
+| The role does not hold the required permission | `403 forbidden` |
+| No `If-Match` / stale `If-Match` | `428 precondition_required` / `412 stale_version` |
+| `to` is not a known status | `422 validation_failed` |
+
+Because the offered transitions and the refusal both come from the same server-side rule
+table, an interface can correct itself from the error rather than guess.
+
+**Why advancing a colleague's work is allowed.** The role matrix grants every member
+`transition work` for their team, so a member may move an item somebody else owns — that is
+what lets a small team cover for one another. Changing *ownership* is a different permission
+and remains restricted. The behaviour is asserted in `tests/test_transitions.py` so it is a
+recorded decision rather than an accident.
+
+### Optimistic concurrency, in one paragraph
+
+Every item response carries an `ETag` of its `version`. A caller that wants to change the
+item sends that back as `If-Match`. The comparison and the `version = version + 1` happen in
+the **same `UPDATE`**, so two clients holding the same version cannot both succeed: the
+first wins, the second is told `412 stale_version` and given the current representation in
+`details.current` so it can refresh and retry. The precondition is deliberately
+**required** rather than optional — an API that silently applies last-write-wins is exactly
+the failure mode the brief asks to avoid.
+
+### History
+
+Every successful mutation writes an `activity_events` row **in the same transaction** as the
+state change, so there is no state change without an explanation and no explanation without
+a state change. If the history write fails, the mutation rolls back — proven by
+`tests/test_activity_atomicity.py`, which breaks the history insert with a trigger and
+asserts the item is byte-unchanged afterwards.
+
+Fields changed by one request produce one event each (in a fixed field order) while bumping
+the version **once**. The activity API itself arrives in Phase 5; until then history is
+written but not yet readable over HTTP.
+
 
 ### `GET /users/directory?query=`
 
@@ -169,12 +392,14 @@ present only for validation failures and lists the offending fields.
 
 | Status | Codes | Meaning |
 | --- | --- | --- |
+| `400` | `idempotency_key_required` | A create arrived without a usable `Idempotency-Key` |
 | `401` | `not_authenticated`, `invalid_session`, `session_expired`, `invalid_credentials` | No usable session — sign in again |
 | `403` | `forbidden` | You are in this team, but your role does not permit it |
 | `404` | `not_found` | Does not exist, **or** belongs to a team you are not in |
-| `409` | `last_admin`, `member_has_assigned_items`, and later `invalid_transition`, `item_already_claimed`, `idempotency_key_reuse` | Conflicts with current state |
-| `412` | `stale_version` | Your `If-Match` version is out of date (work items, Phase 4) |
-| `422` | `validation_failed` | The request body or a parameter failed validation |
+| `409` | `invalid_transition`, `item_already_claimed`, `idempotency_key_reuse`, `idempotency_key_in_progress`, `assignee_required`, `last_admin`, `member_has_assigned_items` | Conflicts with current state |
+| `412` | `stale_version` | Your `If-Match` version is out of date; `details.current` carries the current item |
+| `422` | `validation_failed`, `invalid_assignee` | The request body or a parameter failed validation |
+| `428` | `precondition_required` | A conditional request arrived without `If-Match` |
 | `500` | `internal_error` | Unexpected. The detail is logged, never returned |
 
 **Why `404` rather than `403` across a team boundary.** `403` would confirm that the resource
